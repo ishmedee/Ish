@@ -1,0 +1,49 @@
+# Иш agent — free scheduled runs on GitHub Actions (no server needed)
+# Lives at .github/workflows/digest.yml in your repo.
+#
+# GitHub cron uses UTC. Ulaanbaatar = UTC+8, so:
+#   07:00 UB = 23:00 UTC (previous day)
+#   12:00 UB = 04:00 UTC
+#   17:00 UB = 09:00 UTC
+
+name: ish-digest
+
+on:
+  schedule:
+    - cron: "0 23 * * *"   # 07:00 Ulaanbaatar
+    - cron: "0 4 * * *"    # 12:00 Ulaanbaatar
+    - cron: "0 9 * * *"    # 17:00 Ulaanbaatar
+  workflow_dispatch: {}     # manual "Run workflow" button for testing
+
+permissions:
+  contents: write           # allows committing digest.json back
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests feedparser beautifulsoup4 anthropic Pillow
+
+      - name: Run Иш agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python agent_ish.py
+
+      # Persist digest.json + database so the next run remembers
+      # what it already processed and the website can read fresh news.
+      - name: Save results
+        run: |
+          git config user.name "ish-bot"
+          git config user.email "bot@ish.mn"
+          git add -f digest.json towch.db
+          git diff --cached --quiet || git commit -m "digest: $(date -u +'%Y-%m-%d %H:%M') UTC"
+          git push

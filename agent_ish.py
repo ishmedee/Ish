@@ -408,6 +408,70 @@ def synthesize_cluster(client, cluster):
 
 
 # ──────────────────────────────────────────────────────────────
+# FACEBOOK POSTING
+# ──────────────────────────────────────────────────────────────
+
+FB_API = "https://graph.facebook.com/v23.0"
+# How many top stories to post per edition (don't flood the feed)
+FB_MAX_POSTS = 3
+
+
+def build_caption(item):
+    """Compose the text that accompanies a card on Facebook."""
+    lines = [item["title"], ""]
+    for b in item["bullets"]:
+        lines.append(f"• {b}")
+    if item.get("why"):
+        lines.append("")
+        lines.append(f"💡 Яагаад чухал вэ? {item['why']}")
+    lines.append("")
+    srcs = ", ".join(item.get("sources", [item.get("source", "")]))
+    lines.append(f"📰 Эх сурвалж: {srcs}")
+    lines.append(f"🔗 {item['url']}")
+    lines.append("")
+    lines.append("#Иш #мэдээ")
+    return "\n".join(lines)
+
+
+def post_to_facebook(items_with_cards):
+    """
+    Publish the top stories' cards to the Facebook page.
+    items_with_cards: list of (item_dict, card_path) tuples.
+    Only runs if FB_PAGE_TOKEN and FB_PAGE_ID are set.
+    """
+    token = os.environ.get("FB_PAGE_TOKEN")
+    page_id = os.environ.get("FB_PAGE_ID")
+    if not token or not page_id:
+        print("[fb] skipped (no FB_PAGE_TOKEN / FB_PAGE_ID set)")
+        return
+
+    posted = 0
+    for item, card_path in items_with_cards[:FB_MAX_POSTS]:
+        if not card_path or not os.path.exists(card_path):
+            continue
+        caption = build_caption(item)
+        try:
+            with open(card_path, "rb") as img:
+                r = requests.post(
+                    f"{FB_API}/{page_id}/photos",
+                    data={"caption": caption, "access_token": token},
+                    files={"source": img},
+                    timeout=60,
+                )
+            body = r.json()
+            if r.status_code == 200 and body.get("id"):
+                posted += 1
+                print(f"[fb] posted: {item['title'][:50]}")
+            else:
+                err = body.get("error", {}).get("message", r.text[:200])
+                print(f"[fb] FAILED ({r.status_code}): {err}")
+        except Exception as e:
+            print(f"[fb] error posting {item['title'][:40]}: {e}")
+        time.sleep(2)  # gentle pacing between posts
+    print(f"[fb] {posted} post(s) published to page")
+
+
+# ──────────────────────────────────────────────────────────────
 # OUTPUT
 # ──────────────────────────────────────────────────────────────
 
@@ -522,6 +586,7 @@ def main():
 
     # ── Phase 3: summarize (single) or synthesize (cluster) ───
     processed = 0
+    posted_items = []  # (item, card_path) for Facebook posting
     for cluster in clusters:
         try:
             if len(cluster) == 1:
@@ -557,6 +622,7 @@ def main():
             print(f"[ok]{tag} {d['title'][:55]}")
 
             # render branded card image for social posting
+            card_path = None
             if CARDS_AVAILABLE:
                 try:
                     safe = re.sub(r"[^0-9]", "", primary["url"])[-10:] or str(processed)
@@ -569,6 +635,20 @@ def main():
                 except Exception as ce:
                     print(f"     card failed: {ce}")
 
+            # remember this story + its card for Facebook posting,
+            # tagged with source_count so we can post the biggest first
+            posted_items.append((
+                {
+                    "title": d["title"],
+                    "bullets": d["bullets"],
+                    "why": d.get("why", ""),
+                    "url": primary["url"],
+                    "sources": sources,
+                    "source_count": len(sources),
+                },
+                card_path,
+            ))
+
             time.sleep(1)
         except Exception as e:
             print(f"[fail] cluster {cluster[0]['title'][:40]}: {e}")
@@ -577,6 +657,10 @@ def main():
           f"({skipped_ads} ads skipped free, {merged} multi-source)")
     payload = write_json(con)
     send_telegram(payload)
+
+    # post top stories to Facebook (biggest multi-source stories first)
+    posted_items.sort(key=lambda x: x[0]["source_count"], reverse=True)
+    post_to_facebook(posted_items)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ import re
 import sqlite3
 import sys
 import time
+import hashlib
 from datetime import datetime, timezone, timedelta
 
 import feedparser
@@ -629,11 +630,14 @@ def main():
             card_path = None
             if CARDS_AVAILABLE:
                 try:
-                    safe = re.sub(r"[^0-9]", "", primary["url"])[-10:] or str(processed)
+                    # unique filename per story: counter + short url hash,
+                    # so cards never collide/overwrite (URLs may lack digits)
+                    h = hashlib.md5(primary["url"].encode()).hexdigest()[:8]
+                    fname = f"card_{processed:02d}_{h}.png"
                     card_path = make_card(
                         {**d, "sources": sources},
                         out_dir="cards",
-                        filename=f"card_{safe}.png",
+                        filename=fname,
                     )
                     print(f"     card -> {card_path}")
                 except Exception as ce:

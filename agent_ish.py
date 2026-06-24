@@ -547,6 +547,10 @@ def main():
     client = Anthropic()  # uses ANTHROPIC_API_KEY env var
     con = db_init()
 
+    # startup diagnostics — confirm what's configured this run
+    fb_ready = bool(os.environ.get("FB_PAGE_TOKEN") and os.environ.get("FB_PAGE_ID"))
+    print(f"[config] cards={CARDS_AVAILABLE}  facebook={fb_ready}")
+
     candidates = collect_candidates(con)
     if not candidates:
         print("[main] nothing new, exiting")

@@ -101,6 +101,12 @@ MODEL = "claude-sonnet-4-6" # cheap + good enough for summaries
 DB_PATH = "towch.db"
 OUTPUT_JSON = "digest.json"      # the website reads this file
 REQUEST_TIMEOUT = 15
+
+# ── Queue-system settings ─────────────────────────────────────
+MORNING_FRESH_HOUR = 9   # before this hour, poster may use yesterday's
+                         # leftovers (today's 6am batch might be thin)
+MAX_QUEUE_AGE_DAYS = 5   # drop unposted stories older than this (covers
+                         # a Friday story staying usable through Sunday)
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 
 # ── Level 1: cheap pre-filter (runs BEFORE paying for AI) ──────
@@ -174,7 +180,12 @@ def db_init():
     # migrate older DBs that lack the new columns
     cols = {r[1] for r in con.execute("PRAGMA table_info(digests)")}
     for col, decl in [("sources", "TEXT"), ("source_count", "INTEGER DEFAULT 1"),
-                      ("all_urls", "TEXT")]:
+                      ("all_urls", "TEXT"),
+                      # queue system columns:
+                      ("posted", "INTEGER DEFAULT 0"),      # 0=pending, 1=posted to FB
+                      ("collected_date", "TEXT"),            # YYYY-MM-DD it was collected
+                      ("card_path", "TEXT"),                 # saved card image path
+                      ("posted_at", "TEXT")]:                # when it was posted
         if col not in cols:
             con.execute(f"ALTER TABLE digests ADD COLUMN {col} {decl}")
     con.commit()
@@ -434,6 +445,44 @@ def build_caption(item):
     return "\n".join(lines)
 
 
+def post_one_to_facebook(item, card_path, token, page_id):
+    """Post ONE story's card as a feed post. Returns True on success."""
+    if not card_path or not os.path.exists(card_path):
+        print(f"[fb] no card file for: {item['title'][:40]}")
+        return False
+    caption = build_caption(item)
+    try:
+        # Step 1: upload photo unpublished
+        with open(card_path, "rb") as img:
+            up = requests.post(
+                f"{FB_API}/{page_id}/photos",
+                data={"published": "false", "access_token": token},
+                files={"source": img}, timeout=60,
+            )
+        photo_id = up.json().get("id")
+        if not photo_id:
+            err = up.json().get("error", {}).get("message", up.text[:200])
+            print(f"[fb] upload FAILED ({up.status_code}): {err}")
+            return False
+        # Step 2: create feed post with photo attached
+        r = requests.post(
+            f"{FB_API}/{page_id}/feed",
+            data={"message": caption,
+                  "attached_media[0]": json.dumps({"media_fbid": photo_id}),
+                  "access_token": token},
+            timeout=60,
+        )
+        if r.status_code == 200 and r.json().get("id"):
+            print(f"[fb] posted to feed: {item['title'][:50]}")
+            return True
+        err = r.json().get("error", {}).get("message", r.text[:200])
+        print(f"[fb] feed post FAILED ({r.status_code}): {err}")
+        return False
+    except Exception as e:
+        print(f"[fb] error posting {item['title'][:40]}: {e}")
+        return False
+
+
 def post_to_facebook(items_with_cards):
     """
     Publish the top stories' cards to the Facebook page as proper FEED
@@ -560,23 +609,21 @@ def send_telegram(payload):
 
 
 # ──────────────────────────────────────────────────────────────
-# MAIN RUN
+# COLLECTOR MODE — fetch, summarize, queue (no posting)
 # ──────────────────────────────────────────────────────────────
 
-def main():
+def run_collector():
     now = datetime.now(UB_TZ)
-    print(f"\n===== Товч agent run @ {now.isoformat()} =====")
+    today = now.date().isoformat()
+    print(f"\n===== Иш COLLECTOR run @ {now.isoformat()} =====")
 
     client = Anthropic()  # uses ANTHROPIC_API_KEY env var
     con = db_init()
-
-    # startup diagnostics — confirm what's configured this run
-    fb_ready = bool(os.environ.get("FB_PAGE_TOKEN") and os.environ.get("FB_PAGE_ID"))
-    print(f"[config] cards={CARDS_AVAILABLE}  facebook={fb_ready}")
+    print(f"[config] cards={CARDS_AVAILABLE}")
 
     candidates = collect_candidates(con)
     if not candidates:
-        print("[main] nothing new, exiting")
+        print("[collector] nothing new, exiting")
         write_json(con)
         return
 
@@ -584,8 +631,7 @@ def main():
     articles = []
     skipped_ads = 0
     for src, title, url in candidates:
-        mark_seen(con, url)  # mark even on failure so we don't retry forever
-
+        mark_seen(con, url)
         if looks_like_ad(title, url):
             skipped_ads += 1
             print(f"[skip] ad (free filter): {title[:50]}")
@@ -601,24 +647,22 @@ def main():
             print(f"[fail] {url}: {e}")
 
     if not articles:
-        print("[main] nothing usable after fetch/filter")
+        print("[collector] nothing usable after fetch/filter")
         write_json(con)
         return
 
-    # ── Phase 2: cluster same-story articles across sources ───
+    # ── Phase 2: cluster same-story articles ──────────────────
     clusters = cluster_candidates(client, articles)
     merged = sum(1 for c in clusters if len(c) > 1)
     print(f"[cluster] {len(articles)} articles -> {len(clusters)} stories "
           f"({merged} merged from multiple sources)")
 
-    # ── Phase 3: summarize (single) or synthesize (cluster) ───
-    processed = 0
-    posted_items = []  # (item, card_path) for Facebook posting
+    # ── Phase 3: summarize/synthesize + QUEUE (no posting) ────
+    queued = 0
     for cluster in clusters:
         try:
             if len(cluster) == 1:
-                a = cluster[0]
-                d = summarize(client, a["src"], a["text"])
+                d = summarize(client, cluster[0]["src"], cluster[0]["text"])
             else:
                 d = synthesize_cluster(client, cluster)
 
@@ -632,65 +676,153 @@ def main():
             total_words = sum(len(a["text"].split()) for a in cluster)
             orig_min = max(1, round(total_words / 180))
 
+            # render card now so the poster just uploads it later
+            card_path = None
+            if CARDS_AVAILABLE:
+                try:
+                    h = hashlib.md5(primary["url"].encode()).hexdigest()[:8]
+                    fname = f"card_{queued:02d}_{h}.png"
+                    card_path = make_card({**d, "sources": sources},
+                                          out_dir="cards", filename=fname)
+                except Exception as ce:
+                    print(f"     card failed: {ce}")
+
+            # queue it: posted=0, tagged with today's date
             con.execute(
                 "INSERT OR REPLACE INTO digests "
                 "(url, source, category, title, bullets, why, orig_min, "
-                "published, run_at, sources, source_count, all_urls) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "published, run_at, sources, source_count, all_urls, "
+                "posted, collected_date, card_path) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (primary["url"], primary["src"], d.get("category", "Нийгэм"),
                  d["title"], json.dumps(d["bullets"], ensure_ascii=False),
                  d["why"], orig_min, now.isoformat(), now.isoformat(),
                  json.dumps(sources, ensure_ascii=False), len(sources),
-                 json.dumps(all_urls, ensure_ascii=False)),
+                 json.dumps(all_urls, ensure_ascii=False),
+                 0, today, card_path),
             )
             con.commit()
-            processed += 1
+            queued += 1
             tag = f" [{len(cluster)} sources]" if len(cluster) > 1 else ""
-            print(f"[ok]{tag} {d['title'][:55]}")
-
-            # render branded card image for social posting
-            card_path = None
-            if CARDS_AVAILABLE:
-                try:
-                    # unique filename per story: counter + short url hash,
-                    # so cards never collide/overwrite (URLs may lack digits)
-                    h = hashlib.md5(primary["url"].encode()).hexdigest()[:8]
-                    fname = f"card_{processed:02d}_{h}.png"
-                    card_path = make_card(
-                        {**d, "sources": sources},
-                        out_dir="cards",
-                        filename=fname,
-                    )
-                    print(f"     card -> {card_path}")
-                except Exception as ce:
-                    print(f"     card failed: {ce}")
-
-            # remember this story + its card for Facebook posting,
-            # tagged with source_count so we can post the biggest first
-            posted_items.append((
-                {
-                    "title": d["title"],
-                    "bullets": d["bullets"],
-                    "why": d.get("why", ""),
-                    "url": primary["url"],
-                    "sources": sources,
-                    "source_count": len(sources),
-                },
-                card_path,
-            ))
-
+            print(f"[queued]{tag} {d['title'][:55]}")
             time.sleep(1)
         except Exception as e:
             print(f"[fail] cluster {cluster[0]['title'][:40]}: {e}")
 
-    print(f"[main] {processed} stories published "
-          f"({skipped_ads} ads skipped free, {merged} multi-source)")
-    payload = write_json(con)
-    send_telegram(payload)
+    # housekeeping: drop stale unposted stories (older than MAX_QUEUE_AGE_DAYS)
+    cutoff = (now.date() - timedelta(days=MAX_QUEUE_AGE_DAYS)).isoformat()
+    dropped = con.execute(
+        "DELETE FROM digests WHERE posted=0 AND collected_date < ?", (cutoff,)
+    ).rowcount
+    con.commit()
 
-    # post top stories to Facebook (biggest multi-source stories first)
-    posted_items.sort(key=lambda x: x[0]["source_count"], reverse=True)
-    post_to_facebook(posted_items)
+    pending = con.execute("SELECT COUNT(*) FROM digests WHERE posted=0").fetchone()[0]
+    print(f"[collector] {queued} queued ({skipped_ads} ads skipped, "
+          f"{merged} multi-source); {dropped} stale dropped; "
+          f"{pending} total pending in queue")
+    write_json(con)
+
+
+# ──────────────────────────────────────────────────────────────
+# POSTER MODE — pick ONE queued story and post it
+# ──────────────────────────────────────────────────────────────
+
+def pick_story_to_post(con, now):
+    """
+    Selection logic:
+      • Weekend (Sat/Sun): draw from the whole pending stockpile.
+      • Weekday early-morning (before MORNING_FRESH_HOUR): prefer today's,
+        else yesterday's leftovers (fresh batch may not be collected yet).
+      • Weekday main hours: STRICTLY today's; only if today's queue is
+        empty, fall back to leftovers.
+    Within the allowed pool, order by importance then freshness.
+    Returns (row_dict or None, mode_str).
+    """
+    today = now.date().isoformat()
+    is_weekend = now.weekday() >= 5
+
+    def fetch(where, params):
+        return con.execute(
+            "SELECT url, source, category, title, bullets, why, sources, "
+            "source_count, card_path, collected_date FROM digests "
+            "WHERE posted=0 AND " + where +
+            " ORDER BY source_count DESC, collected_date DESC LIMIT 1",
+            params,
+        ).fetchone()
+
+    if is_weekend:
+        row = fetch("1=1", ())
+        mode = "weekend-stockpile"
+    elif now.hour < MORNING_FRESH_HOUR:
+        row = fetch("collected_date = ?", (today,)) or fetch("collected_date < ?", (today,))
+        mode = "morning"
+    else:
+        row = fetch("collected_date = ?", (today,))
+        if row:
+            mode = "weekday-today"
+        else:
+            row = fetch("collected_date < ?", (today,))
+            mode = "weekday-fallback-leftover"
+
+    if not row:
+        return None, mode
+    keys = ["url", "source", "category", "title", "bullets", "why",
+            "sources", "source_count", "card_path", "collected_date"]
+    return dict(zip(keys, row)), mode
+
+
+def run_poster():
+    now = datetime.now(UB_TZ)
+    print(f"\n===== Иш POSTER run @ {now.isoformat()} =====")
+    con = db_init()
+
+    token = os.environ.get("FB_PAGE_TOKEN")
+    page_id = os.environ.get("FB_PAGE_ID")
+    if not token or not page_id:
+        print("[poster] no FB credentials — abort")
+        return
+
+    story, mode = pick_story_to_post(con, now)
+    if not story:
+        pending = con.execute("SELECT COUNT(*) FROM digests WHERE posted=0").fetchone()[0]
+        print(f"[poster] queue empty for mode '{mode}' — nothing to post "
+              f"({pending} pending overall)")
+        return
+
+    print(f"[poster] mode={mode}  picking: {story['title'][:55]}")
+    item = {
+        "title": story["title"],
+        "bullets": json.loads(story["bullets"]) if story["bullets"] else [],
+        "why": story["why"] or "",
+        "url": story["url"],
+        "sources": json.loads(story["sources"]) if story["sources"] else [story["source"]],
+        "source_count": story["source_count"] or 1,
+    }
+
+    ok = post_one_to_facebook(item, story["card_path"], token, page_id)
+    if ok:
+        con.execute("UPDATE digests SET posted=1, posted_at=? WHERE url=?",
+                    (now.isoformat(), story["url"]))
+        con.commit()
+        pending = con.execute("SELECT COUNT(*) FROM digests WHERE posted=0").fetchone()[0]
+        print(f"[poster] posted ✓  ({pending} still pending)")
+    else:
+        print("[poster] post failed — left in queue for next hour")
+
+
+# ──────────────────────────────────────────────────────────────
+# ENTRYPOINT — mode dispatch via command-line argument
+# ──────────────────────────────────────────────────────────────
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "collect"
+    if mode == "collect":
+        run_collector()
+    elif mode == "post":
+        run_poster()
+    else:
+        print(f"Unknown mode '{mode}'. Use 'collect' or 'post'.")
+        return 1
 
 
 if __name__ == "__main__":

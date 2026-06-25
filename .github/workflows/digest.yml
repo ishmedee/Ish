@@ -1,54 +1,52 @@
-# Иш agent — free scheduled runs on GitHub Actions (no server needed)
-# Lives at .github/workflows/digest.yml in your repo.
+# Иш agent — collector + poster modes, triggered externally by cron-job.org
+# (GitHub's own scheduler is unreliable for private repos, so cron-job.org
+#  hits the workflow_dispatch trigger on schedule instead.)
 #
-# GitHub cron uses UTC. Ulaanbaatar = UTC+8, so:
-#   07:00 UB = 23:00 UTC (previous day)
-#   12:00 UB = 04:00 UTC
-#   17:00 UB = 09:00 UTC
+# Two cron-job.org jobs call this with different inputs:
+#   • collector: 3x/day weekdays (06:00, 12:00, 17:00 UB) -> mode=collect
+#   • poster:    hourly 07:00-23:00 daily               -> mode=post
 
 name: ish-digest
 
 on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "collect or post"
+        required: false
+        default: "post"
+  # keep a schedule as backup, though cron-job.org is the primary trigger
   schedule:
-    # GitHub's on-the-hour slots are congested and often delayed/dropped,
-    # so we use off-peak minutes (:17) for more reliable firing.
-    - cron: "17 23 * * *"   # ~07:17 Ulaanbaatar
-    - cron: "17 4 * * *"    # ~12:17 Ulaanbaatar
-    - cron: "17 9 * * *"    # ~17:17 Ulaanbaatar
-  workflow_dispatch: {}     # manual "Run workflow" button for testing
+    - cron: "0 22 * * 1-5"   # 06:00 UB Mon-Fri (collect) - see note below
 
 permissions:
-  contents: write           # allows committing digest.json back
+  contents: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install dependencies
         run: pip install requests feedparser beautifulsoup4 anthropic Pillow
 
-      - name: Run Иш agent
+      - name: Run Иш agent (${{ github.event.inputs.mode || 'post' }})
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
-        run: python agent_ish.py
+        run: python agent_ish.py ${{ github.event.inputs.mode || 'post' }}
 
-      # Persist digest.json + database so the next run remembers
-      # what it already processed and the website can read fresh news.
       - name: Save results
         run: |
           git config user.name "ish-bot"
           git config user.email "bot@ish.mn"
           git add -f digest.json towch.db
-          git diff --cached --quiet || git commit -m "digest: $(date -u +'%Y-%m-%d %H:%M') UTC"
+          git diff --cached --quiet || git commit -m "ish: $(date -u +'%Y-%m-%d %H:%M') UTC"
           git pull --rebase --autostash || true
           git push

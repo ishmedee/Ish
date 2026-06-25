@@ -799,7 +799,24 @@ def run_poster():
         "source_count": story["source_count"] or 1,
     }
 
-    ok = post_one_to_facebook(item, story["card_path"], token, page_id)
+    # Regenerate the card now — the collector ran on a different machine,
+    # so its card file no longer exists. Redraw from queued data (free/fast).
+    card_path = None
+    if CARDS_AVAILABLE:
+        try:
+            h = hashlib.md5(story["url"].encode()).hexdigest()[:8]
+            card_path = make_card(
+                {"title": item["title"], "bullets": item["bullets"],
+                 "why": item["why"], "category": story["category"],
+                 "sources": item["sources"]},
+                out_dir="cards", filename=f"post_{h}.png",
+            )
+        except Exception as ce:
+            print(f"[poster] card render failed: {ce}")
+    else:
+        card_path = story["card_path"]  # fallback to stored path
+
+    ok = post_one_to_facebook(item, card_path, token, page_id)
     if ok:
         con.execute("UPDATE digests SET posted=1, posted_at=? WHERE url=?",
                     (now.isoformat(), story["url"]))

@@ -10,9 +10,11 @@ name: ish-digest
 
 on:
   schedule:
-    - cron: "0 23 * * *"   # 07:00 Ulaanbaatar
-    - cron: "0 4 * * *"    # 12:00 Ulaanbaatar
-    - cron: "0 9 * * *"    # 17:00 Ulaanbaatar
+    # GitHub's on-the-hour slots are congested and often delayed/dropped,
+    # so we use off-peak minutes (:17) for more reliable firing.
+    - cron: "17 23 * * *"   # ~07:17 Ulaanbaatar
+    - cron: "17 4 * * *"    # ~12:17 Ulaanbaatar
+    - cron: "17 9 * * *"    # ~17:17 Ulaanbaatar
   workflow_dispatch: {}     # manual "Run workflow" button for testing
 
 permissions:

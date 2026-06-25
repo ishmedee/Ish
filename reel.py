@@ -18,8 +18,12 @@ import subprocess
 
 REEL_SECONDS = 10
 PAPER = "0xF4F6F5"   # background pad color (matches card bg)
-# bundled royalty-free ambient bed (synthesized, license-free)
-AMBIENT = os.path.join(os.path.dirname(__file__), "assets", "ambient_bed.aac")
+# user-provided royalty-free track (from Pixabay etc). Falls back to the
+# bundled synthesized bed if music.mp3 is absent.
+_ASSET_DIR = os.path.join(os.path.dirname(__file__), "assets")
+_MUSIC_MP3 = os.path.join(_ASSET_DIR, "music.mp3")
+_AMBIENT_FALLBACK = os.path.join(_ASSET_DIR, "ambient_bed.aac")
+AMBIENT = _MUSIC_MP3 if os.path.exists(_MUSIC_MP3) else _AMBIENT_FALLBACK
 
 
 def make_reel(card_path, out_dir="reels", filename=None, seconds=REEL_SECONDS):
@@ -49,7 +53,11 @@ def make_reel(card_path, out_dir="reels", filename=None, seconds=REEL_SECONDS):
         cmd += ["-i", AMBIENT]
     cmd += ["-filter_complex", vf, "-map", "[v]"]
     if has_audio:
-        cmd += ["-map", "1:a", "-c:a", "aac", "-b:a", "128k", "-shortest"]
+        # take first `seconds` of the track, fade in 1s / out 1.5s, normalize
+        fade_out_start = max(0, seconds - 1.5)
+        af = (f"atrim=0:{seconds},afade=t=in:st=0:d=1,"
+              f"afade=t=out:st={fade_out_start}:d=1.5,aresample=44100")
+        cmd += ["-map", "1:a", "-af", af, "-c:a", "aac", "-b:a", "128k", "-shortest"]
     cmd += ["-c:v", "libx264", "-t", str(seconds), "-pix_fmt", "yuv420p", out]
 
     try:

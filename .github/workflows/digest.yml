@@ -31,7 +31,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install requests feedparser beautifulsoup4 anthropic Pillow
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          pip install requests feedparser beautifulsoup4 anthropic Pillow
 
       - name: Run Иш agent (${{ github.event.inputs.mode || 'post' }})
         env:

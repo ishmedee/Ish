@@ -38,6 +38,17 @@ except Exception as _card_err:
     CARDS_AVAILABLE = False
     print(f"[cards] disabled: {_card_err}")
 
+# Reel generator (optional — needs ffmpeg + reel.py)
+try:
+    from reel import make_reel
+    REELS_AVAILABLE = True
+except Exception as _reel_err:
+    REELS_AVAILABLE = False
+    print(f"[reels] disabled: {_reel_err}")
+
+# Master switch: post Reels in addition to feed posts
+POST_REELS = os.environ.get("POST_REELS", "1") == "1"
+
 # ──────────────────────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────────────────────
@@ -483,6 +494,75 @@ def post_one_to_facebook(item, card_path, token, page_id):
         return False
 
 
+def post_reel_to_facebook(item, reel_path, token, page_id):
+    """
+    Publish a Reel to the page via the 3-phase Reels API:
+      1. start  -> get video_id + upload_url
+      2. upload -> POST the file binary to the upload_url
+      3. finish -> publish with description
+    Returns True on success (Reel accepted for processing).
+    """
+    if not reel_path or not os.path.exists(reel_path):
+        print(f"[reel] no video file for: {item['title'][:40]}")
+        return False
+    caption = build_caption(item)
+    reel_api = "https://graph.facebook.com/v23.0"
+    try:
+        # Phase 1: start upload session
+        start = requests.post(
+            f"{reel_api}/{page_id}/video_reels",
+            data={"upload_phase": "start", "access_token": token},
+            timeout=30,
+        )
+        sb = start.json()
+        video_id = sb.get("video_id")
+        upload_url = sb.get("upload_url")
+        if not video_id or not upload_url:
+            err = sb.get("error", {}).get("message", start.text[:200])
+            print(f"[reel] start FAILED ({start.status_code}): {err}")
+            return False
+
+        # Phase 2: upload the binary to the rupload endpoint
+        file_size = os.path.getsize(reel_path)
+        with open(reel_path, "rb") as f:
+            up = requests.post(
+                upload_url,
+                headers={
+                    "Authorization": f"OAuth {token}",
+                    "offset": "0",
+                    "file_size": str(file_size),
+                },
+                data=f.read(),
+                timeout=180,
+            )
+        if up.status_code != 200 or not up.json().get("success", True):
+            print(f"[reel] upload FAILED ({up.status_code}): {up.text[:200]}")
+            return False
+
+        # Phase 3: finish + publish
+        fin = requests.post(
+            f"{reel_api}/{page_id}/video_reels",
+            params={
+                "upload_phase": "finish",
+                "video_id": video_id,
+                "video_state": "PUBLISHED",
+                "description": caption,
+                "access_token": token,
+            },
+            timeout=60,
+        )
+        fb = fin.json()
+        if fin.status_code == 200 and fb.get("success", False):
+            print(f"[reel] posted reel: {item['title'][:50]}")
+            return True
+        err = fb.get("error", {}).get("message", fin.text[:200])
+        print(f"[reel] finish FAILED ({fin.status_code}): {err}")
+        return False
+    except Exception as e:
+        print(f"[reel] error posting {item['title'][:40]}: {e}")
+        return False
+
+
 def post_to_facebook(items_with_cards):
     """
     Publish the top stories' cards to the Facebook page as proper FEED
@@ -823,6 +903,19 @@ def run_poster():
         con.commit()
         pending = con.execute("SELECT COUNT(*) FROM digests WHERE posted=0").fetchone()[0]
         print(f"[poster] posted ✓  ({pending} still pending)")
+
+        # Also post a Reel using the SAME card (reuse, don't regenerate card)
+        if POST_REELS and REELS_AVAILABLE and card_path:
+            try:
+                h = hashlib.md5(story["url"].encode()).hexdigest()[:8]
+                reel_path = make_reel(card_path, out_dir="reels",
+                                      filename=f"reel_{h}.mp4")
+                if reel_path:
+                    post_reel_to_facebook(item, reel_path, token, page_id)
+                else:
+                    print("[poster] reel render returned nothing")
+            except Exception as re:
+                print(f"[poster] reel step failed: {re}")
     else:
         print("[poster] post failed — left in queue for next hour")
 

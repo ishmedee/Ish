@@ -436,8 +436,12 @@ def build_caption(item):
 
 def post_to_facebook(items_with_cards):
     """
-    Publish the top stories' cards to the Facebook page.
-    items_with_cards: list of (item_dict, card_path) tuples.
+    Publish the top stories' cards to the Facebook page as proper FEED
+    posts (image + text on the timeline), not album photo uploads.
+
+    Method: upload each card unpublished (published=false) to get a photo
+    id, then create a /feed post with that photo attached. This produces
+    a normal timeline post with full news-feed distribution.
     Only runs if FB_PAGE_TOKEN and FB_PAGE_ID are set.
     """
     token = os.environ.get("FB_PAGE_TOKEN")
@@ -452,24 +456,42 @@ def post_to_facebook(items_with_cards):
             continue
         caption = build_caption(item)
         try:
+            # Step 1: upload the photo UNPUBLISHED to get its id
             with open(card_path, "rb") as img:
-                r = requests.post(
+                up = requests.post(
                     f"{FB_API}/{page_id}/photos",
-                    data={"caption": caption, "access_token": token},
+                    data={"published": "false", "access_token": token},
                     files={"source": img},
                     timeout=60,
                 )
+            up_body = up.json()
+            photo_id = up_body.get("id")
+            if not photo_id:
+                err = up_body.get("error", {}).get("message", up.text[:200])
+                print(f"[fb] upload FAILED ({up.status_code}): {err}")
+                continue
+
+            # Step 2: create a real FEED post with the photo attached
+            r = requests.post(
+                f"{FB_API}/{page_id}/feed",
+                data={
+                    "message": caption,
+                    "attached_media[0]": json.dumps({"media_fbid": photo_id}),
+                    "access_token": token,
+                },
+                timeout=60,
+            )
             body = r.json()
             if r.status_code == 200 and body.get("id"):
                 posted += 1
-                print(f"[fb] posted: {item['title'][:50]}")
+                print(f"[fb] posted to feed: {item['title'][:50]}")
             else:
                 err = body.get("error", {}).get("message", r.text[:200])
-                print(f"[fb] FAILED ({r.status_code}): {err}")
+                print(f"[fb] feed post FAILED ({r.status_code}): {err}")
         except Exception as e:
             print(f"[fb] error posting {item['title'][:40]}: {e}")
         time.sleep(2)  # gentle pacing between posts
-    print(f"[fb] {posted} post(s) published to page")
+    print(f"[fb] {posted} feed post(s) published to page")
 
 
 # ──────────────────────────────────────────────────────────────

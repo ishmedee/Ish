@@ -27,6 +27,16 @@ from datetime import datetime, timezone, timedelta
 
 import feedparser
 import requests
+
+# curl_cffi impersonates Chrome's TLS fingerprint to get past 403 blocks
+# on sites that detect plain-Python requests (news.mn, gogo.mn, eguur.mn).
+# Falls back to regular requests if unavailable.
+try:
+    from curl_cffi import requests as cffi_requests
+    CFFI_AVAILABLE = True
+except Exception as _cffi_err:
+    CFFI_AVAILABLE = False
+    print(f"[fetch] curl_cffi unavailable, using plain requests: {_cffi_err}")
 from bs4 import BeautifulSoup
 from anthropic import Anthropic
 
@@ -116,30 +126,27 @@ SOURCES = [
         "base_url": "https://eguur.mn",
         "article_selector": "div.entry-content, article, div.content, main",
     },
-    # ── gogo.mn: PARKED — returns 403 to scrapers. Needs a headless
-    #    browser (Playwright) to fetch, or a publisher partnership.
-    #    Re-enable by uncommenting once that's built. Pattern: /r/<code>
-    # {
-    #     "name": "gogo.mn",
-    #     "listing": "https://gogo.mn/i/2",        # Улс төр
-    #     "link_pattern": r"/r/[a-z0-9]+",
-    #     "base_url": "https://gogo.mn",
-    #     "article_selector": "div.article-body, div.news-detail, div.content, article",
-    # },
-    # {
-    #     "name": "gogo.mn-eco",
-    #     "listing": "https://gogo.mn/i/3",        # Эдийн засаг
-    #     "link_pattern": r"/r/[a-z0-9]+",
-    #     "base_url": "https://gogo.mn",
-    #     "article_selector": "div.article-body, div.news-detail, div.content, article",
-    # },
-    # {
-    #     "name": "gogo.mn-society",
-    #     "listing": "https://gogo.mn/i/7",        # Нийгэм
-    #     "link_pattern": r"/r/[a-z0-9]+",
-    #     "base_url": "https://gogo.mn",
-    #     "article_selector": "div.article-body, div.news-detail, div.content, article",
-    # },
+    # ── gogo.mn: re-enabled with curl_cffi (Chrome TLS impersonation).
+    #    If it still 403s in logs, re-comment these two blocks.
+    {
+        "name": "gogo.mn-pol",
+        "listing": "https://gogo.mn/i/2",        # Улс төр
+        "link_pattern": r"/r/[a-z0-9]+",
+        "base_url": "https://gogo.mn",
+        "article_selector": "div.article-body, div.news-detail, div.content, article",
+    },
+    {
+        "name": "gogo.mn-eco",
+        "listing": "https://gogo.mn/i/3",        # Эдийн засаг
+        "link_pattern": r"/r/[a-z0-9]+",
+        "base_url": "https://gogo.mn",
+        "article_selector": "div.article-body, div.news-detail, div.content, article",
+    },
+    {
+        "name": "news.mn",
+        "rss": "https://news.mn/feed/",           # WordPress RSS
+        "article_selector": "div.article-body, div.entry-content, div.content, article",
+    },
 ]
 
 MAX_ARTICLES_PER_RUN = 12        # cost & noise control
@@ -155,7 +162,14 @@ MORNING_FRESH_HOUR = 9   # before this hour, poster may use yesterday's
                          # leftovers (today's 6am batch might be thin)
 MAX_QUEUE_AGE_DAYS = 5   # drop unposted stories older than this (covers
                          # a Friday story staying usable through Sunday)
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "mn,en-US;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 # ── Level 1: cheap pre-filter (runs BEFORE paying for AI) ──────
 # If an article's URL or title trips these, we skip it for free
@@ -285,8 +299,31 @@ def mark_seen(con, url):
 # COLLECTION
 # ──────────────────────────────────────────────────────────────
 
+def fetch_html(url, timeout=REQUEST_TIMEOUT):
+    """
+    Fetch a page using curl_cffi with Chrome TLS impersonation (defeats
+    most 403 bot-blocks), falling back to plain requests if curl_cffi
+    isn't available or errors out.
+    """
+    if CFFI_AVAILABLE:
+        try:
+            return cffi_requests.get(
+                url, headers=HEADERS, timeout=timeout, impersonate="chrome"
+            )
+        except Exception as e:
+            print(f"[fetch] curl_cffi failed ({e}); falling back to requests")
+    return requests.get(url, headers=HEADERS, timeout=timeout)
+
+
 def collect_from_rss(src, con):
-    feed = feedparser.parse(src["rss"])
+    # fetch the feed via curl_cffi (some sites block plain feedparser),
+    # then hand the raw bytes to feedparser.
+    try:
+        r = fetch_html(src["rss"])
+        feed = feedparser.parse(r.content)
+    except Exception as e:
+        print(f"[collect] {src['name']} RSS fetch failed: {e}")
+        feed = feedparser.parse(src["rss"])  # last-resort direct parse
     fresh = []
     for entry in feed.entries:
         url = entry.get("link", "").strip()
@@ -299,7 +336,7 @@ def collect_from_rss(src, con):
 
 def collect_from_listing(src, con):
     """Scrape a normal news-list page for article links."""
-    r = requests.get(src["listing"], headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    r = fetch_html(src["listing"])
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     pattern = re.compile(src["link_pattern"])
@@ -347,7 +384,7 @@ def collect_candidates(con):
 
 def fetch_article_text(url, selector):
     """Download the article page and extract readable text."""
-    r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    r = fetch_html(url)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 

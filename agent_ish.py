@@ -126,26 +126,22 @@ SOURCES = [
         "base_url": "https://eguur.mn",
         "article_selector": "div.entry-content, article, div.content, main",
     },
-    # ── gogo.mn: re-enabled with curl_cffi (Chrome TLS impersonation).
-    #    If it still 403s in logs, re-comment these two blocks.
+    # ── gogo.mn & news.mn: IP-blocked from GitHub; routed through free
+    #    proxies (use_proxy). Free proxies are flaky, so these may often
+    #    come up empty — that's expected and handled gracefully.
     {
         "name": "gogo.mn-pol",
         "listing": "https://gogo.mn/i/2",        # Улс төр
         "link_pattern": r"/r/[a-z0-9]+",
         "base_url": "https://gogo.mn",
         "article_selector": "div.article-body, div.news-detail, div.content, article",
-    },
-    {
-        "name": "gogo.mn-eco",
-        "listing": "https://gogo.mn/i/3",        # Эдийн засаг
-        "link_pattern": r"/r/[a-z0-9]+",
-        "base_url": "https://gogo.mn",
-        "article_selector": "div.article-body, div.news-detail, div.content, article",
+        "use_proxy": True,
     },
     {
         "name": "news.mn",
-        "rss": "https://news.mn/feed/",           # WordPress RSS
+        "rss": "https://news.mn/feed/",
         "article_selector": "div.article-body, div.entry-content, div.content, article",
+        "use_proxy": True,
     },
 ]
 
@@ -299,12 +295,17 @@ def mark_seen(con, url):
 # COLLECTION
 # ──────────────────────────────────────────────────────────────
 
-def fetch_html(url, timeout=REQUEST_TIMEOUT):
+def fetch_html(url, timeout=REQUEST_TIMEOUT, use_proxy=False):
     """
-    Fetch a page using curl_cffi with Chrome TLS impersonation (defeats
-    most 403 bot-blocks), falling back to plain requests if curl_cffi
-    isn't available or errors out.
+    Fetch a page. Normal sources use curl_cffi with Chrome TLS impersonation.
+    IP-blocked sources (use_proxy=True) route through free proxies first,
+    then fall back to a direct attempt.
     """
+    if use_proxy:
+        r = fetch_via_proxy(url, timeout=min(timeout, 12))
+        if r is not None:
+            return r
+        # fall through to a direct attempt (usually fails, but harmless)
     if CFFI_AVAILABLE:
         try:
             return cffi_requests.get(
@@ -315,11 +316,78 @@ def fetch_html(url, timeout=REQUEST_TIMEOUT):
     return requests.get(url, headers=HEADERS, timeout=timeout)
 
 
+# ── Free-proxy pool (for IP-blocked sources like gogo.mn / news.mn) ──
+_PROXY_LIST_URL = ("https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list"
+                   "@main/proxies/protocols/http/data.json")
+_proxy_pool = None   # cached per run
+
+def get_proxy_pool(limit=8):
+    """
+    Fetch a small pool of high-uptime free HTTP proxies, sorted by uptime.
+    Cached for the run. Returns list of 'http://ip:port' strings (maybe []).
+    Free proxies are unreliable, so callers must try several and fall back.
+    """
+    global _proxy_pool
+    if _proxy_pool is not None:
+        return _proxy_pool
+    urls = [
+        _PROXY_LIST_URL,
+        "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/all/data.json",
+    ]
+    data = None
+    for u in urls:
+        try:
+            r = requests.get(u, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                break
+        except Exception:
+            continue
+    if not data:
+        print("[proxy] could not load proxy list")
+        _proxy_pool = []
+        return _proxy_pool
+    try:
+        # only HTTP-capable proxies for requests' http/https routing
+        good = [p for p in data
+                if p.get("protocol", "http") in ("http", "https")
+                and (p.get("uptime_percent") or 0) >= 80
+                and (p.get("latency_ms") or 9999) < 2000]
+        good.sort(key=lambda p: (-(p.get("uptime_percent") or 0),
+                                 p.get("latency_ms") or 9999))
+        _proxy_pool = [f"http://{p['ip']}:{p['port']}" for p in good[:limit]]
+        print(f"[proxy] loaded {len(_proxy_pool)} candidate proxies")
+    except Exception as e:
+        print(f"[proxy] parse failed: {e}")
+        _proxy_pool = []
+    return _proxy_pool
+
+
+def fetch_via_proxy(url, timeout=12, tries=4):
+    """
+    Fetch a URL through free proxies, trying several until one works.
+    Returns a response or None. Bounded so flaky proxies can't hang a run.
+    """
+    pool = get_proxy_pool()
+    for proxy in pool[:tries]:
+        try:
+            proxies = {"http": proxy, "https": proxy}
+            r = requests.get(url, headers=HEADERS, proxies=proxies,
+                             timeout=timeout)
+            if r.status_code == 200 and len(r.text) > 500:
+                print(f"[proxy] ok via {proxy}")
+                return r
+        except Exception:
+            continue  # dead proxy, try next
+    print(f"[proxy] all proxies failed for {url[:50]}")
+    return None
+
+
 def collect_from_rss(src, con):
     # fetch the feed via curl_cffi (some sites block plain feedparser),
     # then hand the raw bytes to feedparser.
     try:
-        r = fetch_html(src["rss"])
+        r = fetch_html(src["rss"], use_proxy=src.get("use_proxy", False))
         feed = feedparser.parse(r.content)
     except Exception as e:
         print(f"[collect] {src['name']} RSS fetch failed: {e}")
@@ -336,7 +404,7 @@ def collect_from_rss(src, con):
 
 def collect_from_listing(src, con):
     """Scrape a normal news-list page for article links."""
-    r = fetch_html(src["listing"])
+    r = fetch_html(src["listing"], use_proxy=src.get("use_proxy", False))
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     pattern = re.compile(src["link_pattern"])
@@ -382,9 +450,9 @@ def collect_candidates(con):
     return candidates[:MAX_ARTICLES_PER_RUN]
 
 
-def fetch_article_text(url, selector):
+def fetch_article_text(url, selector, use_proxy=False):
     """Download the article page and extract readable text."""
-    r = fetch_html(url)
+    r = fetch_html(url, use_proxy=use_proxy)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -876,7 +944,8 @@ def run_collector():
             print(f"[skip] ad (free filter): {title[:50]}")
             continue
         try:
-            text = fetch_article_text(url, src["article_selector"])
+            text = fetch_article_text(url, src["article_selector"],
+                                      use_proxy=src.get("use_proxy", False))
             if len(text) < MIN_ARTICLE_CHARS:
                 print(f"[skip] too short: {title[:50]}")
                 continue

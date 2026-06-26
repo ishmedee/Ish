@@ -86,6 +86,36 @@ SOURCES = [
         "base_url": "https://montsame.mn",
         "article_selector": "div.article-content, div.content, article",
     },
+    {
+        "name": "tovch.mn-pol",
+        "listing": "https://tovch.mn/politics",        # Улс төр (politics)
+        "link_pattern": r"/n/[a-z0-9]+",
+        "base_url": "https://tovch.mn",
+        "article_selector": "article, div.news-detail, div.content, main",
+    },
+    {
+        "name": "tovch.mn-soc",
+        "listing": "https://tovch.mn/society",         # Нийгэм (social)
+        "link_pattern": r"/n/[a-z0-9]+",
+        "base_url": "https://tovch.mn",
+        "article_selector": "article, div.news-detail, div.content, main",
+    },
+    {
+        "name": "eguur.mn-pol",
+        # politics category (URL-encoded 'улс-төр'); skips entertainment
+        "listing": "https://eguur.mn/category/%d1%83%d0%bb%d1%81-%d1%82%d3%a9%d1%80/",
+        "link_pattern": r"eguur\.mn/\d{5,}/",
+        "base_url": "https://eguur.mn",
+        "article_selector": "div.entry-content, article, div.content, main",
+    },
+    {
+        "name": "eguur.mn-soc",
+        # society category (URL-encoded 'нийгэм')
+        "listing": "https://eguur.mn/category/%d0%bd%d0%b8%d0%b9%d0%b3%d1%8d%d0%bc/",
+        "link_pattern": r"eguur\.mn/\d{5,}/",
+        "base_url": "https://eguur.mn",
+        "article_selector": "div.entry-content, article, div.content, main",
+    },
     # ── gogo.mn: PARKED — returns 403 to scrapers. Needs a headless
     #    browser (Playwright) to fetch, or a publisher partnership.
     #    Re-enable by uncommenting once that's built. Pattern: /r/<code>

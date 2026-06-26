@@ -73,6 +73,13 @@ SOURCES = [
         "article_selector": "div.article-content, div.content, article",
     },
     {
+        "name": "MONTSAME-pol",
+        "listing": "https://montsame.mn/mn/more/18",  # УЛС ТӨР (politics)
+        "link_pattern": r"/mn/read/\d+",
+        "base_url": "https://montsame.mn",
+        "article_selector": "div.article-content, div.content, article",
+    },
+    {
         "name": "MONTSAME-eco",
         "listing": "https://montsame.mn/mn/more/10",  # ЭДИЙН ЗАСАГ
         "link_pattern": r"/mn/read/\d+",
@@ -147,6 +154,19 @@ def looks_like_ad(title, url):
 
 
 CATEGORIES = ["Улс төр", "Эдийн засаг", "Нийгэм", "Технологи", "Спорт", "Дэлхий"]
+
+# ── Editorial focus: bias selection toward target mix ─────────
+# Goal ~70% local politics, ~20% social + important foreign, ~10% rest.
+# These are additive boosts to a story's interest score (0-100 base),
+# applied at collection time so the poster surfaces the target mix.
+CATEGORY_BOOST = {
+    "Улс төр":    35,   # politics — primary focus (~70%)
+    "Нийгэм":     15,   # social — secondary (~20% shared w/ world)
+    "Дэлхий":     12,   # world/foreign — secondary, important ones rise
+    "Эдийн засаг": 3,   # economy — light (part of the ~10%)
+    "Технологи":   0,   # rest
+    "Спорт":       0,   # rest
+}
 
 PROMPT = """Чи Монголын мэдээг энгийн ойлгомжтой болгодог редактор.
 Доорх нийтлэлийг уншаад ЗӨВХӨН дараах JSON-оор хариул (өөр юу ч бичихгүй, markdown хэрэглэхгүй):
@@ -839,11 +859,13 @@ def run_collector():
             orig_min = max(1, round(total_words / 180))
 
             # blended interest score: 50% importance + 50% emotional pull,
-            # with a small boost for multi-source (already-big) stories.
+            # with a small boost for multi-source (already-big) stories,
+            # plus an editorial category boost (politics-led focus mix).
             imp = max(0, min(100, int(d.get("importance", 50))))
             emo = max(0, min(100, int(d.get("emotional", 50))))
             multi_boost = min(15, (len(sources) - 1) * 5)
-            interest = min(100, round(0.5 * imp + 0.5 * emo) + multi_boost)
+            cat_boost = CATEGORY_BOOST.get(d.get("category", ""), 0)
+            interest = min(100, round(0.5 * imp + 0.5 * emo) + multi_boost + cat_boost)
 
             # render card now so the poster just uploads it later
             card_path = None

@@ -50,5 +50,18 @@ jobs:
           git config user.email "bot@ish.mn"
           git add -f digest.json towch.db
           git diff --cached --quiet || git commit -m "ish: $(date -u +'%Y-%m-%d %H:%M') UTC"
-          git pull --rebase --autostash || true
-          git push
+          # Robust push with retries. On conflict (concurrent collector/poster
+          # run touched towch.db), take OUR freshly-written copy — our run just
+          # finished and its DB reflects the latest state including this run's work.
+          for i in 1 2 3 4 5; do
+            if git push 2>/dev/null; then
+              echo "pushed on attempt $i"; break
+            fi
+            echo "push attempt $i failed — reconciling with remote"
+            git fetch origin main
+            git merge -X ours origin/main -m "merge remote (keep our DB)" 2>/dev/null \
+              || { git checkout --ours towch.db digest.json 2>/dev/null; \
+                   git add -f towch.db digest.json; \
+                   git commit -m "resolve: keep our DB" 2>/dev/null || true; }
+            sleep 3
+          done

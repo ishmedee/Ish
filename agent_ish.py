@@ -718,6 +718,52 @@ def send_telegram(payload):
 # COLLECTOR MODE — fetch, summarize, queue (no posting)
 # ──────────────────────────────────────────────────────────────
 
+def is_duplicate_of_recent(client, con, new_title, new_bullets, days=3):
+    """
+    Check if a freshly-summarized story describes the SAME event as something
+    already queued or recently posted. Clustering only dedupes within one
+    collector run; this catches the same event appearing across different runs
+    (e.g. 6:30 batch vs 11:30 batch, or two outlets worded differently).
+    Returns True if it's a duplicate (should skip).
+    """
+    cutoff = (datetime.now(UB_TZ).date() - timedelta(days=days)).isoformat()
+    rows = con.execute(
+        "SELECT title FROM digests "
+        "WHERE collected_date >= ? OR posted=1 "
+        "ORDER BY run_at DESC LIMIT 40", (cutoff,)
+    ).fetchall()
+    recent = [r[0] for r in rows if r[0]]
+    if not recent:
+        return False
+
+    # quick exact-ish check first (free): identical title
+    if new_title in recent:
+        return True
+
+    # ask Claude: is the new story the same EVENT as any recent one?
+    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(recent))
+    prompt = (
+        "Доорх 'ШИНЭ мэдээ' нь 'ӨМНӨХ мэдээнүүд'-ийн аль нэгтэй ЯГ ИЖИЛ үйл "
+        "явдлыг өгүүлж байна уу? (өөр өнцөг биш, ижил үйл явдал)\n\n"
+        f"ШИНЭ мэдээ: {new_title}\n"
+        f"({'; '.join(new_bullets[:2])})\n\n"
+        f"ӨМНӨХ мэдээнүүд:\n{numbered}\n\n"
+        "ЗӨВХӨН JSON: {\"duplicate\": true/false, \"match\": <дугаар эсвэл 0>}"
+    )
+    try:
+        msg = client.messages.create(
+            model=MODEL,
+            max_tokens=80,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = "".join(b.text for b in msg.content if b.type == "text")
+        d = _parse_json_lenient(raw)
+        return bool(d.get("duplicate", False))
+    except Exception as e:
+        print(f"[dedup] check failed (allowing through): {e}")
+        return False
+
+
 def run_collector():
     now = datetime.now(UB_TZ)
     today = now.date().isoformat()
@@ -779,6 +825,11 @@ def run_collector():
             # safety floor: skip content that could get the page banned/sued
             if d.get("block", False):
                 print(f"[skip] safety floor (block): {cluster[0]['title'][:50]}")
+                continue
+
+            # cross-run dedup: skip if same event already queued/recently posted
+            if is_duplicate_of_recent(client, con, d["title"], d.get("bullets", [])):
+                print(f"[skip] duplicate of recent: {d['title'][:50]}")
                 continue
 
             primary = cluster[0]

@@ -155,7 +155,10 @@ PROMPT = """Чи Монголын мэдээг энгийн ойлгомжтой
  "category": "{cats} — аль нэгийг сонго",
  "bullets": ["хамгийн чухал 3 баримтыг 3 товч өгүүлбэрээр", "...", "..."],
  "why": "энгийн иргэнд яагаад хамаатай болохыг 1 өгүүлбэрээр",
- "newsworthy": true/false}}
+ "newsworthy": true/false,
+ "importance": 0-100,
+ "emotional": 0-100,
+ "block": true/false}}
 
 "newsworthy" дүгнэлт (ЧУХАЛ):
 false бол — дараах тохиолдолд:
@@ -166,6 +169,18 @@ false бол — дараах тохиолдолд:
 true бол — жинхэнэ мэдээ: улс төр, эдийн засаг, нийгэм, технологи,
   түүнчлэн спорт, соёл, хүн сонирхсон зөөлөн мэдээ ч мөн true.
 Эргэлзвэл true. Зорилго: зар, хоосон PR-ийг шүүх, бодит мэдээг үлдээх.
+
+"importance" (0-100): энэ мэдээ хүмүүсийн амьдрал, мөнгө, ажил, аюулгүй
+  байдалд хэр их нөлөөлөх вэ? Бодлого, хууль, эдийн засаг, томоохон
+  үйл явдал = өндөр оноо.
+"emotional" (0-100): энэ мэдээ хэр их анхаарал татах, сэтгэл хөдөлгөх вэ?
+  Зөрчил, маргаан, гэнэтийн/гайхалтай үйл явдал, дуулиан, хүний драм =
+  өндөр оноо. Уйтгартай албан мэдээ = бага оноо.
+"block" (ЦӨӨХӨН тохиолдолд true): зөвхөн дараах тохиолдолд true —
+  цуст/аймшигт дүрслэл, гамшиг/золгүй явдлын хохирогчийг мөлжсөн,
+  баталгаагүй гүтгэлэг/нэр төр гутаах, үзэн ядалт өдөөсөн контент.
+  Бусад бүх тохиолдолд false. Энэ нь зөвхөн хуудсыг хоригдохоос хамгаалах
+  доод хязгаар — ердийн сэтгэл хөдөлгөм, дуулиантай мэдээг блоклохгүй.
 
 Нийтлэл ({source}):
 {text}"""
@@ -196,7 +211,8 @@ def db_init():
                       ("posted", "INTEGER DEFAULT 0"),      # 0=pending, 1=posted to FB
                       ("collected_date", "TEXT"),            # YYYY-MM-DD it was collected
                       ("card_path", "TEXT"),                 # saved card image path
-                      ("posted_at", "TEXT")]:                # when it was posted
+                      ("posted_at", "TEXT"),                 # when it was posted
+                      ("interest_score", "INTEGER DEFAULT 50")]:  # engagement ranking
         if col not in cols:
             con.execute(f"ALTER TABLE digests ADD COLUMN {col} {decl}")
     con.commit()
@@ -407,7 +423,17 @@ SYNTH_PROMPT = """Чи Монголын мэдээг энгийн ойлгомж
  "category": "{cats} — аль нэгийг сонго",
  "bullets": ["бүх эх сурвалжийн чухал баримтыг нэгтгэсэн 3 өгүүлбэр", "...", "..."],
  "why": "энгийн иргэнд яагаад хамаатайг 1 өгүүлбэрээр",
- "newsworthy": true/false}}
+ "newsworthy": true/false,
+ "importance": 0-100,
+ "emotional": 0-100,
+ "block": true/false}}
+
+"importance" (0-100): хүмүүсийн амьдрал, мөнгө, ажил, аюулгүй байдалд
+  хэр нөлөөлөх вэ (бодлого, хууль, эдийн засаг = өндөр).
+"emotional" (0-100): хэр анхаарал татах, сэтгэл хөдөлгөх вэ (зөрчил,
+  дуулиан, гэнэтийн үйл явдал = өндөр; уйтгартай албан мэдээ = бага).
+"block" (зөвхөн цөөхөн): цуст/аймшигт дүрслэл, золгүй явдлын хохирогчийг
+  мөлжсөн, баталгаагүй гүтгэлэг, үзэн ядалт өдөөсөн л бол true. Бусад false.
 
 Эх сурвалжууд зөрчилтэй мэдээлэл өгвөл түүнийг тэмдэглэ.
 {articles}"""
@@ -750,11 +776,23 @@ def run_collector():
                 print(f"[skip] not newsworthy (AI filter): {cluster[0]['title'][:50]}")
                 continue
 
+            # safety floor: skip content that could get the page banned/sued
+            if d.get("block", False):
+                print(f"[skip] safety floor (block): {cluster[0]['title'][:50]}")
+                continue
+
             primary = cluster[0]
             sources = sorted({a["src"] for a in cluster})
             all_urls = [a["url"] for a in cluster]
             total_words = sum(len(a["text"].split()) for a in cluster)
             orig_min = max(1, round(total_words / 180))
+
+            # blended interest score: 50% importance + 50% emotional pull,
+            # with a small boost for multi-source (already-big) stories.
+            imp = max(0, min(100, int(d.get("importance", 50))))
+            emo = max(0, min(100, int(d.get("emotional", 50))))
+            multi_boost = min(15, (len(sources) - 1) * 5)
+            interest = min(100, round(0.5 * imp + 0.5 * emo) + multi_boost)
 
             # render card now so the poster just uploads it later
             card_path = None
@@ -772,19 +810,19 @@ def run_collector():
                 "INSERT OR REPLACE INTO digests "
                 "(url, source, category, title, bullets, why, orig_min, "
                 "published, run_at, sources, source_count, all_urls, "
-                "posted, collected_date, card_path) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "posted, collected_date, card_path, interest_score) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (primary["url"], primary["src"], d.get("category", "Нийгэм"),
                  d["title"], json.dumps(d["bullets"], ensure_ascii=False),
                  d["why"], orig_min, now.isoformat(), now.isoformat(),
                  json.dumps(sources, ensure_ascii=False), len(sources),
                  json.dumps(all_urls, ensure_ascii=False),
-                 0, today, card_path),
+                 0, today, card_path, interest),
             )
             con.commit()
             queued += 1
             tag = f" [{len(cluster)} sources]" if len(cluster) > 1 else ""
-            print(f"[queued]{tag} {d['title'][:55]}")
+            print(f"[queued]{tag} (score {interest}) {d['title'][:50]}")
             time.sleep(1)
         except Exception as e:
             print(f"[fail] cluster {cluster[0]['title'][:40]}: {e}")
@@ -826,7 +864,7 @@ def pick_story_to_post(con, now):
             "SELECT url, source, category, title, bullets, why, sources, "
             "source_count, card_path, collected_date FROM digests "
             "WHERE posted=0 AND " + where +
-            " ORDER BY source_count DESC, collected_date DESC LIMIT 1",
+            " ORDER BY interest_score DESC, source_count DESC, collected_date DESC LIMIT 1",
             params,
         ).fetchone()
 

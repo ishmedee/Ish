@@ -216,6 +216,7 @@ PROMPT = """Чи Монголын мэдээг энгийн ойлгомжтой
  "category": "{cats} — аль нэгийг сонго",
  "bullets": ["хамгийн чухал 3 баримтыг 3 товч өгүүлбэрээр", "...", "..."],
  "why": "энгийн иргэнд яагаад хамаатай болохыг 1 өгүүлбэрээр",
+ "full_text": "Facebook пост дээр тавих дэлгэрэнгүй текст: 4-6 өгүүлбэрээр үйл явдлын гол утга, ар дэвсгэр, нөхцөл байдал, үр дагаврыг тайлбарла. Уншигчид гарчгаас цааш ойлгохоор бичнэ. Товч биш, гэхдээ хэт урт биш. Мэдээллийг үнэн зөв, нэмэлт таамаггүй.",
  "newsworthy": true/false,
  "importance": 0-100,
  "emotional": 0-100,
@@ -285,7 +286,8 @@ def db_init():
                       ("collected_date", "TEXT"),            # YYYY-MM-DD it was collected
                       ("card_path", "TEXT"),                 # saved card image path
                       ("posted_at", "TEXT"),                 # when it was posted
-                      ("interest_score", "INTEGER DEFAULT 50")]:  # engagement ranking
+                      ("interest_score", "INTEGER DEFAULT 50"),  # engagement ranking
+                      ("full_text", "TEXT")]:                # elaborated caption
         if col not in cols:
             con.execute(f"ALTER TABLE digests ADD COLUMN {col} {decl}")
     con.commit()
@@ -591,6 +593,7 @@ SYNTH_PROMPT = """Чи Монголын мэдээг энгийн ойлгомж
  "category": "{cats} — аль нэгийг сонго",
  "bullets": ["бүх эх сурвалжийн чухал баримтыг нэгтгэсэн 3 өгүүлбэр", "...", "..."],
  "why": "энгийн иргэнд яагаад хамаатайг 1 өгүүлбэрээр",
+ "full_text": "Facebook пост дээр тавих дэлгэрэнгүй текст: бүх эх сурвалжийг нэгтгэн 4-6 өгүүлбэрээр үйл явдлын гол утга, ар дэвсгэр, нөхцөл, үр дагаврыг тайлбарла. Нэмэлт таамаггүй, үнэн зөв.",
  "newsworthy": true/false,
  "importance": 0-100,
  "emotional": 0-100,
@@ -642,19 +645,35 @@ FB_MAX_POSTS = 3
 
 
 def build_caption(item):
-    """Compose the text that accompanies a card on Facebook."""
+    """
+    Compose the Facebook post text (caption above the card image).
+    Uses the elaborated `full_text` for depth when available, then the
+    key bullets, the 'why it matters' line, sources, and hashtags.
+    The CARD image itself is unchanged — this only affects post text.
+    """
     lines = [item["title"], ""]
+
+    # Elaborated write-up (the new richer text). Falls back gracefully
+    # to bullets-only if an older queued item lacks full_text.
+    full = (item.get("full_text") or "").strip()
+    if full:
+        lines.append(full)
+        lines.append("")
+
+    # Key points as bullets (kept — they scan well on mobile)
     for b in item["bullets"]:
         lines.append(f"• {b}")
+
     if item.get("why"):
         lines.append("")
         lines.append(f"💡 Яагаад чухал вэ? {item['why']}")
+
     lines.append("")
     srcs = ", ".join(item.get("sources", [item.get("source", "")]))
     lines.append(f"📰 Эх сурвалж: {srcs}")
     lines.append(f"🔗 {item['url']}")
     lines.append("")
-    lines.append("#Иш #мэдээ")
+    lines.append("#Иш #мэдээ #улстөр")
     return "\n".join(lines)
 
 
@@ -1144,7 +1163,12 @@ def run_collector():
             imp = max(0, min(100, int(d.get("importance", 50))))
             emo = max(0, min(100, int(d.get("emotional", 50))))
             multi_boost = min(15, (len(sources) - 1) * 5)
-            interest = min(100, round(0.6 * pol + 0.2 * imp + 0.2 * emo) + multi_boost)
+            # Economy is the preferred FILLER: a modest boost lifts Mongolian
+            # economy stories above other non-political filler, but not above
+            # genuine politics (which scores far higher on `pol`).
+            econ_boost = 12 if d.get("category") == "Эдийн засаг" else 0
+            interest = min(100, round(0.6 * pol + 0.2 * imp + 0.2 * emo)
+                           + multi_boost + econ_boost)
 
             # render card now so the poster just uploads it later
             card_path = None
@@ -1162,14 +1186,14 @@ def run_collector():
                 "INSERT OR REPLACE INTO digests "
                 "(url, source, category, title, bullets, why, orig_min, "
                 "published, run_at, sources, source_count, all_urls, "
-                "posted, collected_date, card_path, interest_score) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "posted, collected_date, card_path, interest_score, full_text) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (primary["url"], primary["src"], d.get("category", "Нийгэм"),
                  d["title"], json.dumps(d["bullets"], ensure_ascii=False),
                  d["why"], orig_min, now.isoformat(), now.isoformat(),
                  json.dumps(sources, ensure_ascii=False), len(sources),
                  json.dumps(all_urls, ensure_ascii=False),
-                 0, today, card_path, interest),
+                 0, today, card_path, interest, d.get("full_text", "")),
             )
             con.commit()
             queued += 1
@@ -1214,9 +1238,15 @@ def pick_story_to_post(con, now):
     def fetch(where, params):
         return con.execute(
             "SELECT url, source, category, title, bullets, why, sources, "
-            "source_count, card_path, collected_date FROM digests "
+            "source_count, card_path, collected_date, full_text FROM digests "
             "WHERE posted=0 AND " + where +
-            " ORDER BY interest_score DESC, source_count DESC, collected_date DESC LIMIT 1",
+            # Primary: highest interest score (politics dominates).
+            # Tie/filler preference: among similar scores, economy stories
+            # (Эдийн засаг) come first — so when strong politics runs out,
+            # Mongolian economy is the preferred filler over other topics.
+            " ORDER BY interest_score DESC, "
+            "          (CASE WHEN category='Эдийн засаг' THEN 0 ELSE 1 END), "
+            "          source_count DESC, collected_date DESC LIMIT 1",
             params,
         ).fetchone()
 
@@ -1237,7 +1267,7 @@ def pick_story_to_post(con, now):
     if not row:
         return None, mode
     keys = ["url", "source", "category", "title", "bullets", "why",
-            "sources", "source_count", "card_path", "collected_date"]
+            "sources", "source_count", "card_path", "collected_date", "full_text"]
     return dict(zip(keys, row)), mode
 
 
@@ -1267,6 +1297,7 @@ def run_poster():
         "url": story["url"],
         "sources": json.loads(story["sources"]) if story["sources"] else [story["source"]],
         "source_count": story["source_count"] or 1,
+        "full_text": story.get("full_text") or "",
     }
 
     # Regenerate the card now — the collector ran on a different machine,
@@ -1314,14 +1345,69 @@ def run_poster():
 # ENTRYPOINT — mode dispatch via command-line argument
 # ──────────────────────────────────────────────────────────────
 
+def run_weather():
+    """Post the morning weather card to Facebook."""
+    now = datetime.now(UB_TZ)
+    print(f"\n===== Иш WEATHER run @ {now.isoformat()} =====")
+    token = os.environ.get("FB_PAGE_TOKEN")
+    page_id = os.environ.get("FB_PAGE_ID")
+    if not token or not page_id:
+        print("[weather] no FB credentials — abort")
+        return
+    try:
+        from weather import make_weather_post
+    except Exception as e:
+        print(f"[weather] module unavailable: {e}")
+        return
+    client = Anthropic()
+    card_path, caption = make_weather_post(client, out_dir="cards")
+    if not card_path or not caption:
+        print("[weather] could not build weather post — skipping")
+        return
+    item = {"title": "Өнөөдрийн цаг агаар", "bullets": [], "why": "",
+            "url": "", "sources": [], "full_text": ""}
+    # post the weather card with its own caption (bypass build_caption)
+    ok = _post_card_with_caption(card_path, caption, token, page_id)
+    print("[weather] posted ✓" if ok else "[weather] post failed")
+
+
+def _post_card_with_caption(card_path, caption, token, page_id):
+    """Post a prebuilt card + caption as a feed post. Returns True on success."""
+    if not card_path or not os.path.exists(card_path):
+        return False
+    try:
+        with open(card_path, "rb") as img:
+            up = requests.post(
+                f"{FB_API}/{page_id}/photos",
+                data={"published": "false", "access_token": token},
+                files={"source": img}, timeout=60,
+            )
+        photo_id = up.json().get("id")
+        if not photo_id:
+            print(f"[weather] upload failed: {up.text[:150]}")
+            return False
+        r = requests.post(
+            f"{FB_API}/{page_id}/feed",
+            data={"message": caption,
+                  "attached_media[0]": json.dumps({"media_fbid": photo_id}),
+                  "access_token": token}, timeout=60,
+        )
+        return r.status_code == 200 and bool(r.json().get("id"))
+    except Exception as e:
+        print(f"[weather] error: {e}")
+        return False
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "collect"
     if mode == "collect":
         run_collector()
     elif mode == "post":
         run_poster()
+    elif mode == "weather":
+        run_weather()
     else:
-        print(f"Unknown mode '{mode}'. Use 'collect' or 'post'.")
+        print(f"Unknown mode '{mode}'. Use 'collect', 'post', or 'weather'.")
         return 1
 
 

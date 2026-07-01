@@ -269,6 +269,69 @@ def make_card(d, out_dir="cards", filename=None):
     return out
 
 
+def make_weather_card(w, bg_image=None, out_dir="cards", filename=None):
+    """
+    Render a morning weather card (1080x1350).
+    w: dict with tmax, tmin, label, wind, precip, date.
+    bg_image: optional path to a condition-matched background photo.
+    The photo is darkened for text legibility; if absent, a brand-blue
+    gradient background is used.
+    """
+    img = Image.new("RGB", (W, H), TENGRI)
+
+    if bg_image and os.path.exists(bg_image):
+        try:
+            bg = Image.open(bg_image).convert("RGB")
+            # cover-fit to canvas
+            scale = max(W / bg.width, H / bg.height)
+            bg = bg.resize((int(bg.width * scale), int(bg.height * scale)))
+            left = (bg.width - W) // 2
+            top = (bg.height - H) // 2
+            bg = bg.crop((left, top, left + W, top + H))
+            # darken for legibility
+            overlay = Image.new("RGB", (W, H), (0, 0, 0))
+            bg = Image.blend(bg, overlay, 0.42)
+            img.paste(bg, (0, 0))
+        except Exception:
+            pass  # keep solid background
+
+    draw = ImageDraw.Draw(img)
+
+    # Иш brand mark, top-left
+    draw.text((MARGIN, 70), "Иш", font=_f("serif_bold", 64), fill=WHITE)
+    draw.text((W - MARGIN - 260, 92), "ЦАГ АГААР",
+              font=_f("sans_bold", 34), fill=WHITE, anchor="la")
+
+    # Big temperature (max), centered-ish
+    tmax_s = f"{w['tmax']}°"
+    draw.text((MARGIN, 360), tmax_s, font=_f("serif_bold", 300), fill=WHITE)
+
+    # min temp + condition label
+    draw.text((MARGIN + 8, 720),
+              f"Доод {w['tmin']}°C",
+              font=_f("sans_bold", 52), fill=(220, 228, 236))
+    draw.text((MARGIN, 800), w["label"],
+              font=_f("sans_bold", 72), fill=WHITE)
+
+    # detail line: wind + precip (no emoji — DejaVu lacks emoji glyphs)
+    details = f"Салхи {w['wind']} км/ц"
+    if w.get("precip", 0) and w["precip"] >= 0.1:
+        details += f"     Тунадас {w['precip']} мм"
+    draw.text((MARGIN, 920), details,
+              font=_f("sans", 44), fill=(220, 228, 236))
+
+    # date footer
+    draw.text((MARGIN, H - 130), w.get("date", ""),
+              font=_f("sans", 40), fill=(210, 218, 226))
+    draw.text((W - MARGIN, H - 130), "ish.mn",
+              font=_f("sans_bold", 40), fill=(210, 218, 226), anchor="ra")
+
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, filename or "weather_card.png")
+    img.save(out, "PNG")
+    return out
+
+
 # ── Standalone test ───────────────────────────────────────────
 if __name__ == "__main__":
     demo = {

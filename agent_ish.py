@@ -894,12 +894,32 @@ def send_telegram(payload):
 # COLLECTOR MODE — fetch, summarize, queue (no posting)
 # ──────────────────────────────────────────────────────────────
 
+def _norm_words(text):
+    """Lowercase word set, stripping short/common tokens, for cheap overlap."""
+    import re as _re
+    words = _re.findall(r"[\w\u0400-\u04FF]+", (text or "").lower())
+    # drop very short tokens (particles) that add noise
+    return {w for w in words if len(w) >= 4}
+
+
+def _title_similarity(a, b):
+    """Jaccard word-overlap between two titles (0-1). Free, no AI."""
+    wa, wb = _norm_words(a), _norm_words(b)
+    if not wa or not wb:
+        return 0.0
+    inter = len(wa & wb)
+    union = len(wa | wb)
+    return inter / union if union else 0.0
+
+
 def is_duplicate_of_recent(client, con, new_title, new_bullets, days=3):
     """
-    Check if a freshly-summarized story describes the SAME event as something
-    already queued or recently posted. Clustering only dedupes within one
-    collector run; this catches the same event appearing across different runs
-    (e.g. 6:30 batch vs 11:30 batch, or two outlets worded differently).
+    Two-stage dedup to minimise AI cost:
+      1. FREE word-overlap pre-filter finds plausible candidates. If the
+         best overlap is very low, it's obviously not a dup — skip the AI
+         call entirely (this is the common case, so most stories cost $0).
+      2. Only when there ARE similar-looking candidates do we ask Claude,
+         and we send just the top few (not all 40) to keep the prompt short.
     Returns True if it's a duplicate (should skip).
     """
     cutoff = (datetime.now(UB_TZ).date() - timedelta(days=days)).isoformat()
@@ -912,24 +932,42 @@ def is_duplicate_of_recent(client, con, new_title, new_bullets, days=3):
     if not recent:
         return False
 
-    # quick exact-ish check first (free): identical title
+    # exact match — free, instant
     if new_title in recent:
         return True
 
-    # ask Claude: is the new story the same EVENT as any recent one?
-    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(recent))
+    # Stage 1: free similarity scoring
+    scored = sorted(
+        ((_title_similarity(new_title, t), t) for t in recent),
+        key=lambda x: x[0], reverse=True,
+    )
+    best_sim = scored[0][0] if scored else 0.0
+
+    # Very high overlap => almost certainly the same event; treat as dup
+    # without paying for an AI call.
+    if best_sim >= 0.6:
+        return True
+    # Very low overlap => clearly different topic; skip the AI call.
+    if best_sim < 0.18:
+        return False
+
+    # Stage 2: ambiguous middle ground — ask Claude, but only about the
+    # top candidates (short prompt), not all 40 titles.
+    candidates = [t for sim, t in scored[:6] if sim >= 0.18]
+    if not candidates:
+        return False
+    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(candidates))
     prompt = (
         "Доорх 'ШИНЭ мэдээ' нь 'ӨМНӨХ мэдээнүүд'-ийн аль нэгтэй ЯГ ИЖИЛ үйл "
         "явдлыг өгүүлж байна уу? (өөр өнцөг биш, ижил үйл явдал)\n\n"
-        f"ШИНЭ мэдээ: {new_title}\n"
-        f"({'; '.join(new_bullets[:2])})\n\n"
+        f"ШИНЭ мэдээ: {new_title}\n\n"
         f"ӨМНӨХ мэдээнүүд:\n{numbered}\n\n"
-        "ЗӨВХӨН JSON: {\"duplicate\": true/false, \"match\": <дугаар эсвэл 0>}"
+        "ЗӨВХӨН JSON: {\"duplicate\": true/false}"
     )
     try:
         msg = client.messages.create(
             model=MODEL,
-            max_tokens=80,
+            max_tokens=30,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = "".join(b.text for b in msg.content if b.type == "text")

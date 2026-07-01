@@ -126,23 +126,24 @@ SOURCES = [
         "base_url": "https://eguur.mn",
         "article_selector": "div.entry-content, article, div.content, main",
     },
-    # ── gogo.mn & news.mn: IP-blocked from GitHub; routed through free
-    #    proxies (use_proxy). Free proxies are flaky, so these may often
-    #    come up empty — that's expected and handled gracefully.
-    {
-        "name": "gogo.mn-pol",
-        "listing": "https://gogo.mn/i/2",        # Улс төр
-        "link_pattern": r"/r/[a-z0-9]+",
-        "base_url": "https://gogo.mn",
-        "article_selector": "div.article-body, div.news-detail, div.content, article",
-        "use_proxy": True,
-    },
-    {
-        "name": "news.mn",
-        "rss": "https://news.mn/feed/",
-        "article_selector": "div.article-body, div.entry-content, div.content, article",
-        "use_proxy": True,
-    },
+    # ── gogo.mn & news.mn: BENCHED. IP-blocked from GitHub; the free-proxy
+    #    route is too flaky to rely on. The proxy infrastructure (fetch_via_proxy,
+    #    use_proxy flag) stays in place — just uncomment these two blocks to
+    #    re-enable when we revisit with a better proxy solution.
+    # {
+    #     "name": "gogo.mn-pol",
+    #     "listing": "https://gogo.mn/i/2",        # Улс төр
+    #     "link_pattern": r"/r/[a-z0-9]+",
+    #     "base_url": "https://gogo.mn",
+    #     "article_selector": "div.article-body, div.news-detail, div.content, article",
+    #     "use_proxy": True,
+    # },
+    # {
+    #     "name": "news.mn",
+    #     "rss": "https://news.mn/feed/",
+    #     "article_selector": "div.article-body, div.entry-content, div.content, article",
+    #     "use_proxy": True,
+    # },
 ]
 
 MAX_ARTICLES_PER_RUN = 12        # cost & noise control

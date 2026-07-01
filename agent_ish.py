@@ -978,6 +978,65 @@ def is_duplicate_of_recent(client, con, new_title, new_bullets, days=3):
         return False
 
 
+def prefilter_political_titles(client, candidates):
+    """
+    Cheap batch pre-filter: rate every candidate TITLE's political relevance
+    in ONE Claude call (titles only, no article text), so we can skip the
+    expensive per-article summarization for obviously non-political stories.
+
+    candidates: list of (src, title, url) tuples.
+    Returns: list of (src, title, url, pol_guess) kept for full processing,
+             biased to keep all political titles + a small filler quota.
+    """
+    if not candidates:
+        return []
+    titles = [t for (_s, t, _u) in candidates]
+    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(titles))
+    prompt = (
+        "Доорх гарчиг бүр МОНГОЛЫН УЛС ТӨРД хэр холбоотойг 0-100-аар үнэл.\n"
+        "Өндөр: УИХ, Засгийн газар, Ерөнхийлөгч, сайд, нам, сонгууль, хууль/\n"
+        "бодлого, авлига, томилгоо, улс төрийн дуулиан, жагсаал, Монголын\n"
+        "гадаад харилцаа. Бага: спорт, зугаа цэнгээл, цэвэр бизнес, алдартан.\n\n"
+        f"Гарчигууд:\n{numbered}\n\n"
+        "ЗӨВХӨН JSON массив буцаа, гарчиг тус бүрийн оноогоор дарааллаар: "
+        "[оноо1, оноо2, ...] (өөр юу ч бичихгүй)."
+    )
+    try:
+        msg = client.messages.create(
+            model=MODEL,
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = "".join(b.text for b in msg.content if b.type == "text")
+        scores = _parse_json_lenient(raw)
+        if not isinstance(scores, list) or len(scores) != len(candidates):
+            print("[prefilter] unexpected response, keeping all")
+            return [(s, t, u, None) for (s, t, u) in candidates]
+    except Exception as e:
+        print(f"[prefilter] failed, keeping all: {e}")
+        return [(s, t, u, None) for (s, t, u) in candidates]
+
+    scored = []
+    for (src, title, url), sc in zip(candidates, scores):
+        try:
+            sc = max(0, min(100, int(sc)))
+        except Exception:
+            sc = 50
+        scored.append((src, title, url, sc))
+
+    # Keep all clearly-political titles (>=35), plus up to a small filler
+    # quota of the best of the rest (so quiet-day slots can still fill).
+    political = [x for x in scored if x[3] >= 35]
+    filler = sorted([x for x in scored if x[3] < 35],
+                    key=lambda x: x[3], reverse=True)[:3]
+    kept = political + filler
+    dropped = len(scored) - len(kept)
+    print(f"[prefilter] {len(scored)} titles -> keep {len(kept)} "
+          f"({len(political)} political + {len(filler)} filler), "
+          f"{dropped} skipped before summarizing")
+    return kept
+
+
 def run_collector():
     now = datetime.now(UB_TZ)
     today = now.date().isoformat()
@@ -993,10 +1052,21 @@ def run_collector():
         write_json(con)
         return
 
+    # ── Phase 0: cheap political pre-filter (titles only) ─────
+    # Skip fetching + summarizing obviously non-political stories.
+    # One batch Claude call rates all titles; we keep political ones
+    # plus a small filler quota. This is the biggest cost saver since
+    # it avoids full summarization of low-value stories.
+    candidates = prefilter_political_titles(client, candidates)
+    if not candidates:
+        print("[collector] nothing political after prefilter")
+        write_json(con)
+        return
+
     # ── Phase 1: fetch text + free ad filter ──────────────────
     articles = []
     skipped_ads = 0
-    for src, title, url in candidates:
+    for src, title, url, _pol in candidates:
         mark_seen(con, url)
         if looks_like_ad(title, url):
             skipped_ads += 1

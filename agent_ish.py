@@ -218,6 +218,8 @@ PROMPT = """Чи Монголын мэдээг энгийн ойлгомжтой
  "newsworthy": true/false,
  "importance": 0-100,
  "emotional": 0-100,
+ "political": 0-100,
+ "mongolia_related": true/false,
  "block": true/false}}
 
 "newsworthy" дүгнэлт (ЧУХАЛ):
@@ -229,6 +231,16 @@ false бол — дараах тохиолдолд:
 true бол — жинхэнэ мэдээ: улс төр, эдийн засаг, нийгэм, технологи,
   түүнчлэн спорт, соёл, хүн сонирхсон зөөлөн мэдээ ч мөн true.
 Эргэлзвэл true. Зорилго: зар, хоосон PR-ийг шүүх, бодит мэдээг үлдээх.
+
+"political" (0-100): энэ мэдээ МОНГОЛЫН УЛС ТӨРД хэр холбоотой вэ? Өндөр оноо:
+  УИХ, Засгийн газар, Ерөнхийлөгч, сайд/албан тушаалтан, намууд, сонгууль,
+  хууль/бодлого, авлига, томилгоо, улс төрийн дуулиан, жагсаал/эсэргүүцэл,
+  улс төртэй холбоотой нийгмийн асуудал, Монголын гадаад харилцаа/дипломат.
+  Бага оноо: спорт, зугаа цэнгээл, технологийн бүтээгдэхүүн, цэвэр бизнес,
+  алдартны мэдээ — улс төртэй огт хамаагүй бол 0-10.
+"mongolia_related" (true/false): энэ мэдээ Монгол Улстай ШУУД холбоотой юу?
+  Гадаадын мэдээ бол зөвхөн Монголыг шууд хамарсан үед true (жишээ:
+  Монгол-хятадын хэлэлцээр). Монголтой хамаагүй цэвэр гадаад мэдээ = false.
 
 "importance" (0-100): энэ мэдээ хүмүүсийн амьдрал, мөнгө, ажил, аюулгүй
   байдалд хэр их нөлөөлөх вэ? Бодлого, хууль, эдийн засаг, томоохон
@@ -581,8 +593,16 @@ SYNTH_PROMPT = """Чи Монголын мэдээг энгийн ойлгомж
  "newsworthy": true/false,
  "importance": 0-100,
  "emotional": 0-100,
+ "political": 0-100,
+ "mongolia_related": true/false,
  "block": true/false}}
 
+"political" (0-100): Монголын улс төрд хэр холбоотой вэ? УИХ, Засгийн газар,
+  Ерөнхийлөгч, сайд, намууд, сонгууль, хууль/бодлого, авлига, томилгоо,
+  улс төрийн дуулиан, жагсаал, Монголын гадаад харилцаа = өндөр. Спорт,
+  зугаа цэнгээл, цэвэр бизнес = 0-10.
+"mongolia_related" (true/false): Монгол Улстай шууд холбоотой юу? Гадаад
+  мэдээ бол зөвхөн Монголыг шууд хамарсан үед true, эс бол false.
 "importance" (0-100): хүмүүсийн амьдрал, мөнгө, ажил, аюулгүй байдалд
   хэр нөлөөлөх вэ (бодлого, хууль, эдийн засаг = өндөр).
 "emotional" (0-100): хэр анхаарал татах, сэтгэл хөдөлгөх вэ (зөрчил,
@@ -988,20 +1008,34 @@ def run_collector():
                 print(f"[skip] duplicate of recent: {d['title'][:50]}")
                 continue
 
+            # POLITICS FOCUS: drop foreign news not tied to Mongolia.
+            # Apolitical stories (sports/entertainment) are NOT dropped —
+            # they enter the queue with low scores as "quiet-day filler",
+            # and the poster only reaches them when politics runs dry
+            # (politics always outscores them). This matches "mostly
+            # politics, allow a little else to fill slots".
+            pol = max(0, min(100, int(d.get("political", 0))))
+            mn_related = bool(d.get("mongolia_related", True))
+            if not mn_related:
+                print(f"[skip] foreign, not Mongolia-related: {d['title'][:45]}")
+                continue
+
             primary = cluster[0]
             sources = sorted({a["src"] for a in cluster})
             all_urls = [a["url"] for a in cluster]
             total_words = sum(len(a["text"].split()) for a in cluster)
             orig_min = max(1, round(total_words / 180))
 
-            # blended interest score: 50% importance + 50% emotional pull,
-            # with a small boost for multi-source (already-big) stories,
-            # plus an editorial category boost (politics-led focus mix).
+            # politics-focused interest score:
+            #   60% political relevance + 20% importance + 20% emotional,
+            #   plus a small multi-source boost. This makes strongly political
+            #   stories dominate the queue, while still allowing a bit of
+            #   high-interest non-political news to fill slots on quiet days
+            #   (it just scores lower and sinks below politics).
             imp = max(0, min(100, int(d.get("importance", 50))))
             emo = max(0, min(100, int(d.get("emotional", 50))))
             multi_boost = min(15, (len(sources) - 1) * 5)
-            cat_boost = CATEGORY_BOOST.get(d.get("category", ""), 0)
-            interest = min(100, round(0.5 * imp + 0.5 * emo) + multi_boost + cat_boost)
+            interest = min(100, round(0.6 * pol + 0.2 * imp + 0.2 * emo) + multi_boost)
 
             # render card now so the poster just uploads it later
             card_path = None

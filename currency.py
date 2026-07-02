@@ -21,6 +21,10 @@ from datetime import datetime, timezone, timedelta
 UB_TZ = timezone(timedelta(hours=8))
 
 RATE_URLS = [
+    # Legacy ASP.NET page: server-rendered HTML with the rate table —
+    # this is what community scrapers use (the new site is JS-rendered
+    # and returns no rates in the raw HTML).
+    "https://www.mongolbank.mn/dblistofficialdailyrate.aspx",
     "https://www.mongolbank.mn/mn/currency-rates",
     "https://www.mongolbank.mn/en/currency-rates",
 ]
@@ -46,7 +50,7 @@ def fetch_rates():
     for url in RATE_URLS:
         try:
             r = fetch_html(url, timeout=25)
-            if r.status_code == 200 and len(r.text) > 5000:
+            if r.status_code == 200 and len(r.text) > 1000:
                 html = r.text
                 break
         except Exception as e:

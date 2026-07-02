@@ -159,6 +159,11 @@ MORNING_FRESH_HOUR = 9   # before this hour, poster may use yesterday's
                          # leftovers (today's 6am batch might be thin)
 MAX_QUEUE_AGE_DAYS = 5   # drop unposted stories older than this (covers
                          # a Friday story staying usable through Sunday)
+REEL_MIN_SCORE = 55      # only make Reels for stories at/above this score:
+                         # posting a Reel for EVERY post tripped Facebook's
+                         # spam rate-limit on the new page (~64 actions/day).
+                         # Gating on score halves Reel volume and focuses
+                         # them on stories worth promoting.
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -1175,7 +1180,8 @@ def pick_story_to_post(con, now):
     def fetch(where, params):
         return con.execute(
             "SELECT url, source, category, title, bullets, why, sources, "
-            "source_count, card_path, collected_date, full_text FROM digests "
+            "source_count, card_path, collected_date, full_text, interest_score "
+            "FROM digests "
             "WHERE posted=0 AND " + where +
             # Primary: highest interest score (politics dominates).
             # Tie/filler preference: among similar scores, economy stories
@@ -1204,7 +1210,8 @@ def pick_story_to_post(con, now):
     if not row:
         return None, mode
     keys = ["url", "source", "category", "title", "bullets", "why",
-            "sources", "source_count", "card_path", "collected_date", "full_text"]
+            "sources", "source_count", "card_path", "collected_date",
+            "full_text", "interest_score"]
     return dict(zip(keys, row)), mode
 
 
@@ -1262,18 +1269,23 @@ def run_poster():
         pending = con.execute("SELECT COUNT(*) FROM digests WHERE posted=0").fetchone()[0]
         print(f"[poster] posted ✓  ({pending} still pending)")
 
-        # Also post a Reel using the SAME card (reuse, don't regenerate card)
+        # Also post a Reel — but ONLY for strong stories (score gate).
+        # Reel-per-post tripped Facebook's spam rate-limit on the new page.
+        score = story.get("interest_score") or 0
         if POST_REELS and REELS_AVAILABLE and card_path:
-            try:
-                h = hashlib.md5(story["url"].encode()).hexdigest()[:8]
-                reel_path = make_reel(card_path, out_dir="reels",
-                                      filename=f"reel_{h}.mp4")
-                if reel_path:
-                    post_reel_to_facebook(item, reel_path, token, page_id)
-                else:
-                    print("[poster] reel render returned nothing")
-            except Exception as re:
-                print(f"[poster] reel step failed: {re}")
+            if score < REEL_MIN_SCORE:
+                print(f"[poster] reel skipped (score {score} < {REEL_MIN_SCORE})")
+            else:
+                try:
+                    h = hashlib.md5(story["url"].encode()).hexdigest()[:8]
+                    reel_path = make_reel(card_path, out_dir="reels",
+                                          filename=f"reel_{h}.mp4")
+                    if reel_path:
+                        post_reel_to_facebook(item, reel_path, token, page_id)
+                    else:
+                        print("[poster] reel render returned nothing")
+                except Exception as re:
+                    print(f"[poster] reel step failed: {re}")
     else:
         print("[poster] post failed — left in queue for next hour")
 

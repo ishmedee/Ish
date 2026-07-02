@@ -332,6 +332,57 @@ def make_weather_card(w, bg_image=None, out_dir="cards", filename=None):
     return out
 
 
+def make_currency_card(d, out_dir="cards", filename=None):
+    """
+    Render the morning currency card (1080x1350): Mongolbank official
+    rates as a clean table in the brand style.
+    d: {"rates": {code: float}, "labels": {code: mongolian}, "date": str}
+    """
+    img = Image.new("RGB", (W, H), PAPER)
+    draw = ImageDraw.Draw(img)
+
+    # green rail (economy color) down the left, like news cards
+    rail = CAT_COLORS.get("Эдийн засаг", TENGRI)
+    draw.rectangle([RAIL_X, 140, RAIL_X + RAIL_W, H - 140], fill=rail)
+
+    draw.text((MARGIN + 40, 90), "Иш", font=_f("serif_bold", 64), fill=TENGRI)
+    draw.text((W - MARGIN, 108), "ВАЛЮТЫН ХАНШ",
+              font=_f("sans_bold", 34), fill=rail, anchor="ra")
+
+    draw.text((MARGIN + 40, 230), "Монголбанкны албан ханш",
+              font=_f("sans_bold", 48), fill=INK)
+    draw.text((MARGIN + 40, 300), d.get("date", ""),
+              font=_f("sans", 38), fill=SLATE)
+
+    # rate rows
+    order = [c for c in ("USD", "EUR", "CNY", "RUB", "JPY", "KRW")
+             if c in d["rates"]]
+    y = 420
+    row_h = 128
+    for code in order:
+        val = d["rates"][code]
+        label = d["labels"].get(code, "")
+        val_s = f"{val:,.2f}" if val < 100 else f"{val:,.0f}"
+        # subtle row divider
+        draw.line([(MARGIN + 40, y + row_h - 18), (W - MARGIN, y + row_h - 18)],
+                  fill=(214, 220, 218), width=2)
+        draw.text((MARGIN + 40, y), code, font=_f("sans_bold", 56), fill=INK)
+        draw.text((MARGIN + 220, y + 10), label, font=_f("sans", 40), fill=SLATE)
+        draw.text((W - MARGIN, y), f"{val_s}₮",
+                  font=_f("sans_bold", 56), fill=TENGRI, anchor="ra")
+        y += row_h
+
+    draw.text((MARGIN + 40, H - 130), "Эх сурвалж: Монголбанк",
+              font=_f("sans", 38), fill=SLATE)
+    draw.text((W - MARGIN, H - 130), "ish.mn",
+              font=_f("sans_bold", 40), fill=SLATE, anchor="ra")
+
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, filename or "currency_card.png")
+    img.save(out, "PNG")
+    return out
+
+
 # ── Standalone test ───────────────────────────────────────────
 if __name__ == "__main__":
     demo = {

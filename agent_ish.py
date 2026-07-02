@@ -196,18 +196,8 @@ def looks_like_ad(title, url):
 
 CATEGORIES = ["Улс төр", "Эдийн засаг", "Нийгэм", "Технологи", "Спорт", "Дэлхий"]
 
-# ── Editorial focus: bias selection toward target mix ─────────
-# Goal ~70% local politics, ~20% social + important foreign, ~10% rest.
-# These are additive boosts to a story's interest score (0-100 base),
-# applied at collection time so the poster surfaces the target mix.
-CATEGORY_BOOST = {
-    "Улс төр":    35,   # politics — primary focus (~70%)
-    "Нийгэм":     15,   # social — secondary (~20% shared w/ world)
-    "Дэлхий":     12,   # world/foreign — secondary, important ones rise
-    "Эдийн засаг": 3,   # economy — light (part of the ~10%)
-    "Технологи":   0,   # rest
-    "Спорт":       0,   # rest
-}
+# (Category-boost table removed: superseded by the politics-focused
+#  scoring — 60% political relevance — plus the economy filler boost.)
 
 PROMPT = """Чи Монголын мэдээг энгийн ойлгомжтой болгодог редактор.
 Доорх нийтлэлийг уншаад ЗӨВХӨН дараах JSON-оор хариул (өөр юу ч бичихгүй, markdown хэрэглэхгүй):
@@ -784,69 +774,8 @@ def post_reel_to_facebook(item, reel_path, token, page_id):
         return False
 
 
-def post_to_facebook(items_with_cards):
-    """
-    Publish the top stories' cards to the Facebook page as proper FEED
-    posts (image + text on the timeline), not album photo uploads.
-
-    Method: upload each card unpublished (published=false) to get a photo
-    id, then create a /feed post with that photo attached. This produces
-    a normal timeline post with full news-feed distribution.
-    Only runs if FB_PAGE_TOKEN and FB_PAGE_ID are set.
-    """
-    token = os.environ.get("FB_PAGE_TOKEN")
-    page_id = os.environ.get("FB_PAGE_ID")
-    if not token or not page_id:
-        print("[fb] skipped (no FB_PAGE_TOKEN / FB_PAGE_ID set)")
-        return
-
-    posted = 0
-    for item, card_path in items_with_cards[:FB_MAX_POSTS]:
-        if not card_path or not os.path.exists(card_path):
-            continue
-        caption = build_caption(item)
-        try:
-            # Step 1: upload the photo UNPUBLISHED to get its id
-            with open(card_path, "rb") as img:
-                up = requests.post(
-                    f"{FB_API}/{page_id}/photos",
-                    data={"published": "false", "access_token": token},
-                    files={"source": img},
-                    timeout=60,
-                )
-            up_body = up.json()
-            photo_id = up_body.get("id")
-            if not photo_id:
-                err = up_body.get("error", {}).get("message", up.text[:200])
-                print(f"[fb] upload FAILED ({up.status_code}): {err}")
-                continue
-
-            # Step 2: create a real FEED post with the photo attached
-            r = requests.post(
-                f"{FB_API}/{page_id}/feed",
-                data={
-                    "message": caption,
-                    "attached_media[0]": json.dumps({"media_fbid": photo_id}),
-                    "access_token": token,
-                },
-                timeout=60,
-            )
-            body = r.json()
-            if r.status_code == 200 and body.get("id"):
-                posted += 1
-                print(f"[fb] posted to feed: {item['title'][:50]}")
-            else:
-                err = body.get("error", {}).get("message", r.text[:200])
-                print(f"[fb] feed post FAILED ({r.status_code}): {err}")
-        except Exception as e:
-            print(f"[fb] error posting {item['title'][:40]}: {e}")
-        time.sleep(2)  # gentle pacing between posts
-    print(f"[fb] {posted} feed post(s) published to page")
-
-
-# ──────────────────────────────────────────────────────────────
-# OUTPUT
-# ──────────────────────────────────────────────────────────────
+# (Old batch post_to_facebook removed — poster posts one story
+#  at a time via post_one_to_facebook.)
 
 def edition_label(now):
     if now.hour < 10:
@@ -1015,7 +944,9 @@ def prefilter_political_titles(client, candidates):
         "Доорх гарчиг бүр МОНГОЛЫН УЛС ТӨРД хэр холбоотойг 0-100-аар үнэл.\n"
         "Өндөр: УИХ, Засгийн газар, Ерөнхийлөгч, сайд, нам, сонгууль, хууль/\n"
         "бодлого, авлига, томилгоо, улс төрийн дуулиан, жагсаал, Монголын\n"
-        "гадаад харилцаа. Бага: спорт, зугаа цэнгээл, цэвэр бизнес, алдартан.\n\n"
+        "гадаад харилцаа. ДУНД (30-50): Монголын эдийн засаг, банк, төсөв,\n"
+        "инфляц, уул уурхайн бодлого. Бага (0-15): спорт, зугаа цэнгээл,\n"
+        "алдартан, улс төртэй огт хамаагүй мэдээ.\n\n"
         f"Гарчигууд:\n{numbered}\n\n"
         "ЗӨВХӨН JSON массив буцаа, гарчиг тус бүрийн оноогоор дарааллаар: "
         "[оноо1, оноо2, ...] (өөр юу ч бичихгүй)."
@@ -1071,6 +1002,13 @@ def run_collector():
         write_json(con)
         return
 
+    # Mark ALL candidates seen BEFORE prefiltering — the prefilter decision
+    # is final. Otherwise dropped titles come back as "new" every run,
+    # get re-prefiltered (wasted tokens), and crowd out genuinely new
+    # articles in the per-source quota.
+    for _s, _t, u in candidates:
+        mark_seen(con, u)
+
     # ── Phase 0: cheap political pre-filter (titles only) ─────
     # Skip fetching + summarizing obviously non-political stories.
     # One batch Claude call rates all titles; we keep political ones
@@ -1086,7 +1024,6 @@ def run_collector():
     articles = []
     skipped_ads = 0
     for src, title, url, _pol in candidates:
-        mark_seen(con, url)
         if looks_like_ad(title, url):
             skipped_ads += 1
             print(f"[skip] ad (free filter): {title[:50]}")
@@ -1364,8 +1301,6 @@ def run_weather():
     if not card_path or not caption:
         print("[weather] could not build weather post — skipping")
         return
-    item = {"title": "Өнөөдрийн цаг агаар", "bullets": [], "why": "",
-            "url": "", "sources": [], "full_text": ""}
     # post the weather card with its own caption (bypass build_caption)
     ok = _post_card_with_caption(card_path, caption, token, page_id)
     print("[weather] posted ✓" if ok else "[weather] post failed")
@@ -1398,6 +1333,28 @@ def _post_card_with_caption(card_path, caption, token, page_id):
         return False
 
 
+def run_currency():
+    """Post the morning Mongolbank rates card to Facebook."""
+    now = datetime.now(UB_TZ)
+    print(f"\n===== Иш CURRENCY run @ {now.isoformat()} =====")
+    token = os.environ.get("FB_PAGE_TOKEN")
+    page_id = os.environ.get("FB_PAGE_ID")
+    if not token or not page_id:
+        print("[currency] no FB credentials — abort")
+        return
+    try:
+        from currency import make_currency_post
+    except Exception as e:
+        print(f"[currency] module unavailable: {e}")
+        return
+    card_path, caption = make_currency_post(out_dir="cards")
+    if not caption:
+        print("[currency] could not build rates post — skipping")
+        return
+    ok = _post_card_with_caption(card_path, caption, token, page_id)
+    print("[currency] posted ✓" if ok else "[currency] post failed")
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "collect"
     if mode == "collect":
@@ -1406,8 +1363,10 @@ def main():
         run_poster()
     elif mode == "weather":
         run_weather()
+    elif mode == "currency":
+        run_currency()
     else:
-        print(f"Unknown mode '{mode}'. Use 'collect', 'post', or 'weather'.")
+        print(f"Unknown mode '{mode}'. Use 'collect', 'post', 'weather', or 'currency'.")
         return 1
 
 

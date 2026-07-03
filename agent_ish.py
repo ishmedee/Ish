@@ -282,7 +282,8 @@ def db_init():
                       ("card_path", "TEXT"),                 # saved card image path
                       ("posted_at", "TEXT"),                 # when it was posted
                       ("interest_score", "INTEGER DEFAULT 50"),  # engagement ranking
-                      ("full_text", "TEXT")]:                # elaborated caption
+                      ("full_text", "TEXT"),                 # elaborated caption
+                      ("image_url", "TEXT")]:                # article og:image
         if col not in cols:
             con.execute(f"ALTER TABLE digests ADD COLUMN {col} {decl}")
     con.commit()
@@ -464,10 +465,22 @@ def collect_candidates(con):
 
 
 def fetch_article_text(url, selector, use_proxy=False):
-    """Download the article page and extract readable text."""
+    """
+    Download the article page. Returns (text, image_url) where image_url
+    is the article's share image (og:image / twitter:image) or None.
+    """
     r = fetch_html(url, use_proxy=use_proxy)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
+
+    # article share image (extract BEFORE decomposing tags)
+    image_url = None
+    for prop in (("property", "og:image"), ("name", "twitter:image"),
+                 ("property", "og:image:url")):
+        m = soup.find("meta", attrs={prop[0]: prop[1]})
+        if m and m.get("content", "").strip().startswith("http"):
+            image_url = m["content"].strip()
+            break
 
     for tag in soup(["script", "style", "nav", "footer", "aside", "iframe"]):
         tag.decompose()
@@ -479,7 +492,7 @@ def fetch_article_text(url, selector, use_proxy=False):
             break
     text = (node or soup.body or soup).get_text(" ", strip=True)
     text = re.sub(r"\s+", " ", text)
-    return text
+    return text, image_url
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1038,13 +1051,14 @@ def run_collector():
             print(f"[skip] ad (free filter): {title[:50]}")
             continue
         try:
-            text = fetch_article_text(url, src["article_selector"],
-                                      use_proxy=src.get("use_proxy", False))
+            text, image_url = fetch_article_text(url, src["article_selector"],
+                                                 use_proxy=src.get("use_proxy", False))
             if len(text) < MIN_ARTICLE_CHARS:
                 print(f"[skip] too short: {title[:50]}")
                 continue
             articles.append({"src": src["name"], "title": title,
-                             "url": url, "text": text})
+                             "url": url, "text": text,
+                             "image_url": image_url})
         except Exception as e:
             print(f"[fail] {url}: {e}")
 
@@ -1132,14 +1146,16 @@ def run_collector():
                 "INSERT OR REPLACE INTO digests "
                 "(url, source, category, title, bullets, why, orig_min, "
                 "published, run_at, sources, source_count, all_urls, "
-                "posted, collected_date, card_path, interest_score, full_text) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "posted, collected_date, card_path, interest_score, full_text, "
+                "image_url) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (primary["url"], primary["src"], d.get("category", "Нийгэм"),
                  d["title"], json.dumps(d["bullets"], ensure_ascii=False),
                  d["why"], orig_min, now.isoformat(), now.isoformat(),
                  json.dumps(sources, ensure_ascii=False), len(sources),
                  json.dumps(all_urls, ensure_ascii=False),
-                 0, today, card_path, interest, d.get("full_text", "")),
+                 0, today, card_path, interest, d.get("full_text", ""),
+                 primary.get("image_url")),
             )
             con.commit()
             queued += 1
@@ -1184,7 +1200,8 @@ def pick_story_to_post(con, now):
     def fetch(where, params):
         return con.execute(
             "SELECT url, source, category, title, bullets, why, sources, "
-            "source_count, card_path, collected_date, full_text, interest_score "
+            "source_count, card_path, collected_date, full_text, interest_score, "
+            "image_url "
             "FROM digests "
             "WHERE posted=0 AND " + where +
             # Primary: highest interest score (politics dominates).
@@ -1215,8 +1232,43 @@ def pick_story_to_post(con, now):
         return None, mode
     keys = ["url", "source", "category", "title", "bullets", "why",
             "sources", "source_count", "card_path", "collected_date",
-            "full_text", "interest_score"]
+            "full_text", "interest_score", "image_url"]
     return dict(zip(keys, row)), mode
+
+
+def download_article_image(image_url, article_url, out_dir="imgs"):
+    """
+    Download the article's share image for the card header.
+    Validates it's a real, reasonably-sized image (rejects tiny logos,
+    favicons, broken files). Returns a local path or None.
+    """
+    try:
+        # find the source config to honor its proxy flag
+        use_proxy = False
+        for s in SOURCES:
+            base = s.get("base_url", "")
+            if base and article_url.startswith(base):
+                use_proxy = s.get("use_proxy", False)
+                break
+        r = fetch_html(image_url, timeout=25, use_proxy=use_proxy)
+        if r.status_code != 200 or len(r.content) < 8000:
+            return None
+        os.makedirs(out_dir, exist_ok=True)
+        h = hashlib.md5(image_url.encode()).hexdigest()[:10]
+        path = os.path.join(out_dir, f"img_{h}.jpg")
+        with open(path, "wb") as f:
+            f.write(r.content)
+        # validate with Pillow: openable and big enough to be a news photo
+        from PIL import Image as _Img
+        with _Img.open(path) as im:
+            im.verify()
+        with _Img.open(path) as im:
+            if im.width < 400 or im.height < 250:
+                return None
+        return path
+    except Exception as e:
+        print(f"[poster] article image skipped ({e})")
+        return None
 
 
 def run_poster():
@@ -1250,6 +1302,12 @@ def run_poster():
 
     # Regenerate the card now — the collector ran on a different machine,
     # so its card file no longer exists. Redraw from queued data (free/fast).
+    # If the article had a share image, download and validate it; the card
+    # uses it as a photo header (falls back to text-only card on any issue).
+    photo_path = None
+    if story.get("image_url"):
+        photo_path = download_article_image(story["image_url"], story["url"])
+
     card_path = None
     if CARDS_AVAILABLE:
         try:
@@ -1259,6 +1317,7 @@ def run_poster():
                  "why": item["why"], "category": story["category"],
                  "sources": item["sources"]},
                 out_dir="cards", filename=f"post_{h}.png",
+                photo_path=photo_path,
             )
         except Exception as ce:
             print(f"[poster] card render failed: {ce}")

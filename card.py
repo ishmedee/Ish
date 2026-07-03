@@ -146,9 +146,12 @@ def line_height(draw, font):
 
 
 # ── Main card builder ─────────────────────────────────────────
-def make_card(d, out_dir="cards", filename=None):
+def make_card(d, out_dir="cards", filename=None, photo_path=None):
     """
     d: digest dict with keys title, bullets, why, category, sources.
+    photo_path: optional article photo — rendered as a header image
+    (~42% of card, cover-cropped, with a photo-credit line). When absent
+    or unusable, the classic text-only layout is used.
     Returns the path to the written PNG.
     """
     os.makedirs(out_dir, exist_ok=True)
@@ -158,21 +161,49 @@ def make_card(d, out_dir="cards", filename=None):
     img = Image.new("RGB", (W, H), PAPER)
     dr = ImageDraw.Draw(img)
 
-    # citation rail
-    dr.rectangle([RAIL_X, MARGIN, RAIL_X + RAIL_W, H - MARGIN], fill=rail)
+    photo_h = 0
+    if photo_path and os.path.exists(photo_path):
+        try:
+            ph = Image.open(photo_path).convert("RGB")
+            photo_h = int(H * 0.42)
+            # cover-crop to W x photo_h
+            scale = max(W / ph.width, photo_h / ph.height)
+            ph = ph.resize((int(ph.width * scale) or 1,
+                            int(ph.height * scale) or 1))
+            left = (ph.width - W) // 2
+            top = (ph.height - photo_h) // 2
+            ph = ph.crop((left, top, left + W, top + photo_h))
+            img.paste(ph, (0, 0))
+            dr = ImageDraw.Draw(img)
+            # photo credit (source attribution)
+            src0 = (d.get("sources") or [""])[0]
+            if src0:
+                credit = f"Фото: {src0}"
+                f_cr = _f("sans", 26)
+                cw = dr.textlength(credit, font=f_cr)
+                dr.rectangle([W - cw - 44, photo_h - 52, W - 12, photo_h - 10],
+                             fill=(0, 0, 0))
+                dr.text((W - cw - 28, photo_h - 46), credit,
+                        font=f_cr, fill=(235, 235, 235))
+        except Exception:
+            photo_h = 0  # unusable photo -> classic text-only layout
+
+    # citation rail (starts below the photo when present)
+    rail_top = photo_h + (30 if photo_h else MARGIN)
+    dr.rectangle([RAIL_X, rail_top, RAIL_X + RAIL_W, H - MARGIN], fill=rail)
 
     content_x = RAIL_X + RAIL_W + 46
     content_w = W - content_x - MARGIN
-    y = MARGIN
+    y = rail_top if photo_h else MARGIN
 
-    # ── header row: wordmark + category ──
-    f_mark = _f("serif_bold", 54)
+    # ── header row: wordmark + category (compact under a photo) ──
+    f_mark = _f("serif_bold", 42 if photo_h else 54)
     dr.text((content_x, y), "Иш", font=f_mark, fill=TENGRI)
     f_cat = _f("sans_bold", 26)
     cat_up = cat.upper()
     cat_w = dr.textlength(cat_up, font=f_cat)
-    dr.text((W - MARGIN - cat_w, y + 16), cat_up, font=f_cat, fill=rail)
-    y += 96
+    dr.text((W - MARGIN - cat_w, y + 12), cat_up, font=f_cat, fill=rail)
+    y += 74 if photo_h else 96
 
     # thin divider
     dr.line([content_x, y, W - MARGIN, y], fill=(225, 229, 227), width=2)

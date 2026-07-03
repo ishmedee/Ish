@@ -202,7 +202,7 @@ def make_card(d, out_dir="cards", filename=None, photo_path=None):
 
     # ── header row: wordmark + category ──
     f_mark = _f("serif_bold", 54)
-    dr.text((content_x, y), "Иш", font=f_mark, fill=pal["mark"])
+    dr.text((content_x, y), "Иш Тойм", font=f_mark, fill=pal["mark"])
     f_cat = _f("sans_bold", 26)
     cat_up = cat.upper()
     cat_w = dr.textlength(cat_up, font=f_cat)
@@ -334,7 +334,7 @@ def make_weather_card(w, bg_image=None, out_dir="cards", filename=None):
     draw = ImageDraw.Draw(img)
 
     # Иш brand mark, top-left
-    draw.text((MARGIN, 70), "Иш", font=_f("serif_bold", 64), fill=WHITE)
+    draw.text((MARGIN, 70), "Иш Тойм", font=_f("serif_bold", 64), fill=WHITE)
     draw.text((W - MARGIN - 260, 92), "ЦАГ АГААР",
               font=_f("sans_bold", 34), fill=WHITE, anchor="la")
 
@@ -381,7 +381,7 @@ def make_currency_card(d, out_dir="cards", filename=None):
     rail = CAT_COLORS.get("Эдийн засаг", TENGRI)
     draw.rectangle([RAIL_X, 140, RAIL_X + RAIL_W, H - 140], fill=rail)
 
-    draw.text((MARGIN + 40, 90), "Иш", font=_f("serif_bold", 64), fill=TENGRI)
+    draw.text((MARGIN + 40, 90), "Иш Тойм", font=_f("serif_bold", 64), fill=TENGRI)
     draw.text((W - MARGIN, 108), "ВАЛЮТЫН ХАНШ",
               font=_f("sans_bold", 34), fill=rail, anchor="ra")
 

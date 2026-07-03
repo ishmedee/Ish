@@ -505,19 +505,32 @@ def _parse_json_lenient(raw):
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        last = raw.rfind("}")
-        if last != -1:
-            try:
-                return json.loads(raw[:last + 1])
-            except json.JSONDecodeError:
-                pass
+        pass
+    # 1) try trimming to the last complete object
+    last = raw.rfind("}")
+    if last != -1:
+        try:
+            return json.loads(raw[:last + 1])
+        except json.JSONDecodeError:
+            pass
+    # 2) truncated mid-string (e.g. full_text cut off): close the open
+    #    string, arrays, and object so the remaining fields stay usable.
+    try:
+        repaired = raw
+        if repaired.count('"') % 2 == 1:
+            repaired += '"'
+        repaired += "]" * max(0, repaired.count("[") - repaired.count("]"))
+        repaired += "}" * max(0, repaired.count("{") - repaired.count("}"))
+        return json.loads(repaired)
+    except json.JSONDecodeError:
         raise
 
 
 def summarize(client, source_name, text):
     msg = client.messages.create(
         model=MODEL,
-        max_tokens=900,
+        max_tokens=1600,   # raised: full_text (4-6 sentences) + fields was
+                           # overflowing 900 and truncating the JSON mid-string
         messages=[{
             "role": "user",
             "content": PROMPT.format(
@@ -636,7 +649,7 @@ def synthesize_cluster(client, cluster):
         blocks.append(f"--- Эх сурвалж: {a['src']} ---\n{a['text'][:4000]}")
     msg = client.messages.create(
         model=MODEL,
-        max_tokens=1000,
+        max_tokens=1600,   # raised to fit full_text without truncation
         messages=[{"role": "user", "content": SYNTH_PROMPT.format(
             cats="/".join(CATEGORIES),
             articles="\n\n".join(blocks),
@@ -1130,16 +1143,11 @@ def run_collector():
             interest = min(100, round(0.6 * pol + 0.2 * imp + 0.2 * emo)
                            + multi_boost + econ_boost)
 
-            # render card now so the poster just uploads it later
+            # No card render here: the poster regenerates the card on its
+            # own machine at post time (collector-rendered files don't
+            # survive across runs), so rendering at collect time was pure
+            # wasted work with a permanently stale path.
             card_path = None
-            if CARDS_AVAILABLE:
-                try:
-                    h = hashlib.md5(primary["url"].encode()).hexdigest()[:8]
-                    fname = f"card_{queued:02d}_{h}.png"
-                    card_path = make_card({**d, "sources": sources},
-                                          out_dir="cards", filename=fname)
-                except Exception as ce:
-                    print(f"     card failed: {ce}")
 
             # queue it: posted=0, tagged with today's date
             con.execute(

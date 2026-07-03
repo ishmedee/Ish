@@ -457,7 +457,10 @@ def collect_candidates(con):
             print(f"[collect] {src['name']}: {len(fresh)} new")
         except Exception as e:
             print(f"[collect] {src['name']} FAILED: {e}")
-    return candidates[:MAX_ARTICLES_PER_RUN]
+    # No early truncation: the title prefilter is the cost gate now (one
+    # cheap batch call judges all titles). The old [:12] cap cut in source
+    # order, silently discarding tovch/eguur political stories every run.
+    return candidates[:40]  # generous safety ceiling only
 
 
 def fetch_article_text(url, selector, use_proxy=False):
@@ -979,9 +982,10 @@ def prefilter_political_titles(client, candidates):
             sc = 50
         scored.append((src, title, url, sc))
 
-    # Keep all clearly-political titles (>=35), plus up to a small filler
-    # quota of the best of the rest (so quiet-day slots can still fill).
-    political = [x for x in scored if x[3] >= 35]
+    # Keep the TOP political titles by score (capped so the wider candidate
+    # net doesn't inflate summarization cost), plus a small filler quota.
+    political = sorted([x for x in scored if x[3] >= 35],
+                       key=lambda x: x[3], reverse=True)[:10]
     filler = sorted([x for x in scored if x[3] < 35],
                     key=lambda x: x[3], reverse=True)[:3]
     kept = political + filler

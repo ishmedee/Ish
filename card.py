@@ -161,52 +161,57 @@ def make_card(d, out_dir="cards", filename=None, photo_path=None):
     img = Image.new("RGB", (W, H), PAPER)
     dr = ImageDraw.Draw(img)
 
-    photo_h = 0
+    # ── optional article photo as FULL-CARD background ──
+    # Cover-fit, darkened for legibility (no credit line: the source is
+    # already cited in the footer). Text switches to a light palette.
+    on_photo = False
     if photo_path and os.path.exists(photo_path):
         try:
             ph = Image.open(photo_path).convert("RGB")
-            photo_h = int(H * 0.42)
-            # cover-crop to W x photo_h
-            scale = max(W / ph.width, photo_h / ph.height)
+            scale = max(W / ph.width, H / ph.height)
             ph = ph.resize((int(ph.width * scale) or 1,
                             int(ph.height * scale) or 1))
             left = (ph.width - W) // 2
-            top = (ph.height - photo_h) // 2
-            ph = ph.crop((left, top, left + W, top + photo_h))
+            top = (ph.height - H) // 2
+            ph = ph.crop((left, top, left + W, top + H))
+            overlay = Image.new("RGB", (W, H), (10, 14, 18))
+            ph = Image.blend(ph, overlay, 0.62)   # strong darken: lots of text
             img.paste(ph, (0, 0))
             dr = ImageDraw.Draw(img)
-            # photo credit (source attribution)
-            src0 = (d.get("sources") or [""])[0]
-            if src0:
-                credit = f"Фото: {src0}"
-                f_cr = _f("sans", 26)
-                cw = dr.textlength(credit, font=f_cr)
-                dr.rectangle([W - cw - 44, photo_h - 52, W - 12, photo_h - 10],
-                             fill=(0, 0, 0))
-                dr.text((W - cw - 28, photo_h - 46), credit,
-                        font=f_cr, fill=(235, 235, 235))
+            on_photo = True
         except Exception:
-            photo_h = 0  # unusable photo -> classic text-only layout
+            on_photo = False  # unusable photo -> classic paper card
 
-    # citation rail (starts below the photo when present)
-    rail_top = photo_h + (30 if photo_h else MARGIN)
-    dr.rectangle([RAIL_X, rail_top, RAIL_X + RAIL_W, H - MARGIN], fill=rail)
+    # palette: dark-on-paper normally, light-on-photo otherwise
+    if on_photo:
+        pal = dict(mark=WHITE, cat=WHITE, divider=(150, 158, 166),
+                   head=WHITE, btxt=(224, 230, 236),
+                   whybg=(28, 36, 46), whyhead=(240, 194, 96),
+                   whytxt=(238, 242, 246), src=(206, 214, 222))
+    else:
+        pal = dict(mark=TENGRI, cat=None,  # cat=None -> use rail color
+                   divider=(225, 229, 227), head=INK, btxt=(48, 58, 70),
+                   whybg=SAFFRONBG, whyhead=SAFFRON, whytxt=INK, src=SLATE)
+
+    # citation rail (full height, as in the classic layout)
+    dr.rectangle([RAIL_X, MARGIN, RAIL_X + RAIL_W, H - MARGIN], fill=rail)
 
     content_x = RAIL_X + RAIL_W + 46
     content_w = W - content_x - MARGIN
-    y = rail_top if photo_h else MARGIN
+    y = MARGIN
 
-    # ── header row: wordmark + category (compact under a photo) ──
-    f_mark = _f("serif_bold", 42 if photo_h else 54)
-    dr.text((content_x, y), "Иш", font=f_mark, fill=TENGRI)
+    # ── header row: wordmark + category ──
+    f_mark = _f("serif_bold", 54)
+    dr.text((content_x, y), "Иш", font=f_mark, fill=pal["mark"])
     f_cat = _f("sans_bold", 26)
     cat_up = cat.upper()
     cat_w = dr.textlength(cat_up, font=f_cat)
-    dr.text((W - MARGIN - cat_w, y + 12), cat_up, font=f_cat, fill=rail)
-    y += 74 if photo_h else 96
+    dr.text((W - MARGIN - cat_w, y + 16), cat_up, font=f_cat,
+            fill=pal["cat"] or rail)
+    y += 96
 
     # thin divider
-    dr.line([content_x, y, W - MARGIN, y], fill=(225, 229, 227), width=2)
+    dr.line([content_x, y, W - MARGIN, y], fill=pal["divider"], width=2)
     y += 50
     top_y = y
 
@@ -266,7 +271,7 @@ def make_card(d, out_dir="cards", filename=None, photo_path=None):
 
     # ── render headline ──
     y = draw_wrapped(dr, (content_x, y), title, f_head,
-                     content_w, INK, line_gap=s["hgap"])
+                     content_w, pal["head"], line_gap=s["hgap"])
     y += 36
 
     # ── render bullets ──
@@ -275,7 +280,7 @@ def make_card(d, out_dir="cards", filename=None, photo_path=None):
         dr.ellipse([content_x, y + s["bul"] // 2, content_x + dot_r * 2,
                     y + s["bul"] // 2 + dot_r * 2], fill=rail)
         y = draw_wrapped(dr, (content_x + 34, y), b, f_bul,
-                         content_w - 34, (48, 58, 70), line_gap=s["blgap"])
+                         content_w - 34, pal["btxt"], line_gap=s["blgap"])
         y += s["bgap"]
 
     # ── render "why" box right below bullets (not floated) ──
@@ -284,16 +289,16 @@ def make_card(d, out_dir="cards", filename=None, photo_path=None):
         wlines_h = measure_wrapped(dr, why, f_why, content_w - 60, 14)
         block_h = 50 + wlines_h + 30
         dr.rounded_rectangle([content_x, y, W - MARGIN, y + block_h],
-                             radius=18, fill=SAFFRONBG)
+                             radius=18, fill=pal["whybg"])
         dr.text((content_x + 30, y + 22), "ЯАГААД ЧУХАЛ ВЭ?",
-                font=f_whyhead, fill=SAFFRON)
+                font=f_whyhead, fill=pal["whyhead"])
         draw_wrapped(dr, (content_x + 30, y + 56), why, f_why,
-                     content_w - 60, INK, line_gap=14)
+                     content_w - 60, pal["whytxt"], line_gap=14)
 
     # ── footer: sources (always in reserved band at bottom) ──
     sources = d.get("sources") or [d.get("source", "")]
     src_text = "Эх сурвалж: " + ", ".join(s2 for s2 in sources if s2)
-    dr.text((content_x, H - MARGIN - src_h), src_text, font=f_src, fill=SLATE)
+    dr.text((content_x, H - MARGIN - src_h), src_text, font=f_src, fill=pal["src"])
 
     out = os.path.join(out_dir, filename or "card.png")
     img.save(out, "PNG")

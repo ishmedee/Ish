@@ -126,6 +126,22 @@ SOURCES = [
         "base_url": "https://eguur.mn",
         "article_selector": "div.entry-content, article, div.content, main",
     },
+    {
+        "name": "zarig.mn-pol",
+        "listing": "https://zarig.mn/politics",
+        # root-level short-code articles (e.g. zarig.mn/1iqh); excludes
+        # section/static slugs via length + end anchor
+        "link_pattern": r"zarig\.mn/(?!busad$|live$)[a-z0-9]{3,5}$",
+        "base_url": "https://zarig.mn",
+        "article_selector": "div.news-detail, article, div.content, main",
+    },
+    {
+        "name": "zarig.mn-soc",
+        "listing": "https://zarig.mn/society",
+        "link_pattern": r"zarig\.mn/(?!busad$|live$)[a-z0-9]{3,5}$",
+        "base_url": "https://zarig.mn",
+        "article_selector": "div.news-detail, article, div.content, main",
+    },
     # ── gogo.mn & news.mn: BENCHED. IP-blocked from GitHub; the free-proxy
     #    route is too flaky to rely on. The proxy infrastructure (fetch_via_proxy,
     #    use_proxy flag) stays in place — just uncomment these two blocks to
@@ -147,7 +163,8 @@ SOURCES = [
 ]
 
 MAX_ARTICLES_PER_RUN = 12        # cost & noise control
-MAX_PER_SOURCE = 4               # balance across outlets
+MAX_PER_SOURCE = 6               # candidates per outlet per run (prefilter
+                                 # is the cost gate, so a wide net is cheap)
 MIN_ARTICLE_CHARS = 400          # skip stubs/photo posts
 MODEL = "claude-sonnet-4-6" # cheap + good enough for summaries
 DB_PATH = "towch.db"
@@ -159,11 +176,11 @@ MORNING_FRESH_HOUR = 9   # before this hour, poster may use yesterday's
                          # leftovers (today's 6am batch might be thin)
 MAX_QUEUE_AGE_DAYS = 5   # drop unposted stories older than this (covers
                          # a Friday story staying usable through Sunday)
-REEL_MIN_SCORE = 55      # only make Reels for stories at/above this score:
-                         # posting a Reel for EVERY post tripped Facebook's
-                         # spam rate-limit on the new page (~64 actions/day).
-                         # Gating on score halves Reel volume and focuses
-                         # them on stories worth promoting.
+REEL_MIN_SCORE = 50      # only make Reels for stories at/above this score.
+                         # Lowered from 55: posting is now HOURLY (was every
+                         # 30 min), so total daily actions are well under the
+                         # spam threshold that bit us before — we can afford
+                         # Reels on a broader set of hot stories.
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -242,9 +259,11 @@ true бол — жинхэнэ мэдээ: улс төр, эдийн засаг,
 "importance" (0-100): энэ мэдээ хүмүүсийн амьдрал, мөнгө, ажил, аюулгүй
   байдалд хэр их нөлөөлөх вэ? Бодлого, хууль, эдийн засаг, томоохон
   үйл явдал = өндөр оноо.
-"emotional" (0-100): энэ мэдээ хэр их анхаарал татах, сэтгэл хөдөлгөх вэ?
-  Зөрчил, маргаан, гэнэтийн/гайхалтай үйл явдал, дуулиан, хүний драм =
-  өндөр оноо. Уйтгартай албан мэдээ = бага оноо.
+"emotional" (0-100): нийгмийн сүлжээнд хэр их анхаарал татах вэ —
+  хүмүүс хуваалцаж, сэтгэгдэл бичиж, маргалдах уу? Өндөр: дуулиан, зөрчил,
+  авлига, гэмт хэрэг, осол, огцруулалт, иргэдийн мөнгөнд нөлөөлөх шийдвэр,
+  гэнэтийн эргэлт, хүний хувь заяаны драм. Бага: ёслол, шагнал, форум,
+  албан ёсны хуурай мэдээ.
 "block" (ЦӨӨХӨН тохиолдолд true): зөвхөн дараах тохиолдолд true —
   цуст/аймшигт дүрслэл, гамшиг/золгүй явдлын хохирогчийг мөлжсөн,
   баталгаагүй гүтгэлэг/нэр төр гутаах, үзэн ядалт өдөөсөн контент.
@@ -633,8 +652,9 @@ SYNTH_PROMPT = """Чи Монголын мэдээг энгийн ойлгомж
   мэдээ бол зөвхөн Монголыг шууд хамарсан үед true, эс бол false.
 "importance" (0-100): хүмүүсийн амьдрал, мөнгө, ажил, аюулгүй байдалд
   хэр нөлөөлөх вэ (бодлого, хууль, эдийн засаг = өндөр).
-"emotional" (0-100): хэр анхаарал татах, сэтгэл хөдөлгөх вэ (зөрчил,
-  дуулиан, гэнэтийн үйл явдал = өндөр; уйтгартай албан мэдээ = бага).
+"emotional" (0-100): нийгмийн сүлжээнд хэр их анхаарал татах вэ
+  (дуулиан, зөрчил, авлига, осол, иргэдийн мөнгөнд нөлөөлөх = өндөр;
+  ёслол, форум, албан хуурай мэдээ = бага).
 "block" (зөвхөн цөөхөн): цуст/аймшигт дүрслэл, золгүй явдлын хохирогчийг
   мөлжсөн, баталгаагүй гүтгэлэг, үзэн ядалт өдөөсөн л бол true. Бусад false.
 
@@ -975,12 +995,19 @@ def prefilter_political_titles(client, candidates):
     titles = [t for (_s, t, _u) in candidates]
     numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(titles))
     prompt = (
-        "Доорх гарчиг бүр МОНГОЛЫН УЛС ТӨРД хэр холбоотойг 0-100-аар үнэл.\n"
-        "Өндөр: УИХ, Засгийн газар, Ерөнхийлөгч, сайд, нам, сонгууль, хууль/\n"
-        "бодлого, авлига, томилгоо, улс төрийн дуулиан, жагсаал, Монголын\n"
-        "гадаад харилцаа. ДУНД (30-50): Монголын эдийн засаг, банк, төсөв,\n"
-        "инфляц, уул уурхайн бодлого. Бага (0-15): спорт, зугаа цэнгээл,\n"
-        "алдартан, улс төртэй огт хамаагүй мэдээ.\n\n"
+        "Чи Монголын мэдээний редактор. Доорх гарчиг бүрд 'ХАЛУУН МЭДЭЭ' "
+        "оноо (0-100) өг: уншигчид хэр их анхаарал хандуулж, хуваалцаж, "
+        "сэтгэгдэл бичих вэ?\n\n"
+        "ӨНДӨР (70-100): улс төрийн дуулиан, авлига, огцруулалт/томилгоо, "
+        "жагсаал эсэргүүцэл, гэмт хэрэг, осол гамшиг, иргэдийн мөнгөнд шууд "
+        "нөлөөлөх шийдвэр (татвар, тэтгэвэр, цалин, үнэ тариф), хурц зөрчил "
+        "маргаан, гэнэтийн том үйл явдал.\n"
+        "ДУНД (40-65): УИХ/Засгийн газрын бодит ажил хэрэг, хууль тогтоомж, "
+        "эдийн засаг банк санхүү, нийгмийн тулгамдсан асуудал (орон сууц, "
+        "эрүүл мэнд, боловсрол, амьжиргаа), сонирхолтой хүний түүх.\n"
+        "БАГА (0-25): ёслол хүндэтгэл, шагнал гардуулалт, форум чуулган "
+        "нээлт, байгууллагын PR, ердийн урьдчилсан мэдээ, спортын хуваарь, "
+        "зар сурталчилгаа.\n\n"
         f"Гарчигууд:\n{numbered}\n\n"
         "ЗӨВХӨН JSON массив буцаа, гарчиг тус бүрийн оноогоор дарааллаар: "
         "[оноо1, оноо2, ...] (өөр юу ч бичихгүй)."
@@ -1008,16 +1035,17 @@ def prefilter_political_titles(client, candidates):
             sc = 50
         scored.append((src, title, url, sc))
 
-    # Keep the TOP political titles by score (capped so the wider candidate
-    # net doesn't inflate summarization cost), plus a small filler quota.
-    political = sorted([x for x in scored if x[3] >= 35],
-                       key=lambda x: x[3], reverse=True)[:10]
-    filler = sorted([x for x in scored if x[3] < 35],
+    # Keep the TOP hot titles (politics + social drama both qualify),
+    # capped so the wide candidate net doesn't inflate summarization cost,
+    # plus a small filler quota for quiet days.
+    hot = sorted([x for x in scored if x[3] >= 30],
+                 key=lambda x: x[3], reverse=True)[:12]
+    filler = sorted([x for x in scored if x[3] < 30],
                     key=lambda x: x[3], reverse=True)[:3]
-    kept = political + filler
+    kept = hot + filler
     dropped = len(scored) - len(kept)
     print(f"[prefilter] {len(scored)} titles -> keep {len(kept)} "
-          f"({len(political)} political + {len(filler)} filler), "
+          f"({len(hot)} hot + {len(filler)} filler), "
           f"{dropped} skipped before summarizing")
     return kept
 
@@ -1133,14 +1161,15 @@ def run_collector():
             #   stories dominate the queue, while still allowing a bit of
             #   high-interest non-political news to fill slots on quiet days
             #   (it just scores lower and sinks below politics).
+            # "hot news" interest score, weighted like a social-media
+            # news editor: attention/viral pull leads (40%), political
+            # weight second (35% — still the page identity), real-life
+            # impact third (25%); plus multi-source and economy boosts.
             imp = max(0, min(100, int(d.get("importance", 50))))
             emo = max(0, min(100, int(d.get("emotional", 50))))
             multi_boost = min(15, (len(sources) - 1) * 5)
-            # Economy is the preferred FILLER: a modest boost lifts Mongolian
-            # economy stories above other non-political filler, but not above
-            # genuine politics (which scores far higher on `pol`).
-            econ_boost = 12 if d.get("category") == "Эдийн засаг" else 0
-            interest = min(100, round(0.6 * pol + 0.2 * imp + 0.2 * emo)
+            econ_boost = 8 if d.get("category") == "Эдийн засаг" else 0
+            interest = min(100, round(0.40 * emo + 0.35 * pol + 0.25 * imp)
                            + multi_boost + econ_boost)
 
             # No card render here: the poster regenerates the card on its

@@ -176,11 +176,7 @@ MORNING_FRESH_HOUR = 9   # before this hour, poster may use yesterday's
                          # leftovers (today's 6am batch might be thin)
 MAX_QUEUE_AGE_DAYS = 5   # drop unposted stories older than this (covers
                          # a Friday story staying usable through Sunday)
-REEL_MIN_SCORE = 50      # only make Reels for stories at/above this score.
-                         # Lowered from 55: posting is now HOURLY (was every
-                         # 30 min), so total daily actions are well under the
-                         # spam threshold that bit us before — we can afford
-                         # Reels on a broader set of hot stories.
+# (REEL_MIN_SCORE removed: at 6 posts/day every post gets a Reel.)
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -228,7 +224,7 @@ PROMPT = """Чи Монголын мэдээг энгийн ойлгомжтой
  "category": "{cats} — аль нэгийг сонго",
  "bullets": ["хамгийн чухал 3 баримтыг 3 товч өгүүлбэрээр", "...", "..."],
  "why": "энгийн иргэнд яагаад хамаатай болохыг 1 өгүүлбэрээр",
- "full_text": "Facebook пост дээр тавих дэлгэрэнгүй текст: 4-6 өгүүлбэрээр үйл явдлын гол утга, ар дэвсгэр, нөхцөл байдал, үр дагаврыг тайлбарла. Уншигчид гарчгаас цааш ойлгохоор бичнэ. Товч биш, гэхдээ хэт урт биш. Мэдээллийг үнэн зөв, нэмэлт таамаггүй.",
+ "full_text": "Facebook пост дээр тавих ДЭЛГЭРЭНГҮЙ текст: 2-3 богино догол мөр (нийт 8-10 өгүүлбэр). Эхний догол мөрт юу болсныг гол баримтуудтай нь; хоёр дахьд ар дэвсгэр, нөхцөл байдал, оролцогч талуудын байр суурь/хариу үйлдэл; сүүлд нь энэ юунд хүргэх, дараа нь юу болох. Догол мөрүүдийг хоосон мөрөөр тусгаарла. Зөвхөн нийтлэлд байгаа баримтаар — нэмэлт таамаггүй.",
  "newsworthy": true/false,
  "importance": 0-100,
  "emotional": 0-100,
@@ -548,8 +544,8 @@ def _parse_json_lenient(raw):
 def summarize(client, source_name, text):
     msg = client.messages.create(
         model=MODEL,
-        max_tokens=1600,   # raised: full_text (4-6 sentences) + fields was
-                           # overflowing 900 and truncating the JSON mid-string
+        max_tokens=2200,   # headroom for the 2-3 paragraph full_text
+                           # (truncation kills the whole story's JSON)
         messages=[{
             "role": "user",
             "content": PROMPT.format(
@@ -636,7 +632,7 @@ SYNTH_PROMPT = """Чи Монголын мэдээг энгийн ойлгомж
  "category": "{cats} — аль нэгийг сонго",
  "bullets": ["бүх эх сурвалжийн чухал баримтыг нэгтгэсэн 3 өгүүлбэр", "...", "..."],
  "why": "энгийн иргэнд яагаад хамаатайг 1 өгүүлбэрээр",
- "full_text": "Facebook пост дээр тавих дэлгэрэнгүй текст: бүх эх сурвалжийг нэгтгэн 4-6 өгүүлбэрээр үйл явдлын гол утга, ар дэвсгэр, нөхцөл, үр дагаврыг тайлбарла. Нэмэлт таамаггүй, үнэн зөв.",
+ "full_text": "Facebook пост дээр тавих ДЭЛГЭРЭНГҮЙ текст: бүх эх сурвалжийг нэгтгэн 2-3 богино догол мөр (нийт 8-10 өгүүлбэр) — юу болсон, ар дэвсгэр нөхцөл, талуудын байр суурь, үр дагавар/дараагийн алхам. Догол мөрүүдийг хоосон мөрөөр тусгаарла. Зөвхөн нийтлэлүүдэд байгаа баримтаар — таамаггүй.",
  "newsworthy": true/false,
  "importance": 0-100,
  "emotional": 0-100,
@@ -669,7 +665,7 @@ def synthesize_cluster(client, cluster):
         blocks.append(f"--- Эх сурвалж: {a['src']} ---\n{a['text'][:4000]}")
     msg = client.messages.create(
         model=MODEL,
-        max_tokens=1600,   # raised to fit full_text without truncation
+        max_tokens=2200,   # headroom for the 2-3 paragraph full_text
         messages=[{"role": "user", "content": SYNTH_PROMPT.format(
             cats="/".join(CATEGORIES),
             articles="\n\n".join(blocks),
@@ -1039,9 +1035,9 @@ def prefilter_political_titles(client, candidates):
     # capped so the wide candidate net doesn't inflate summarization cost,
     # plus a small filler quota for quiet days.
     hot = sorted([x for x in scored if x[3] >= 30],
-                 key=lambda x: x[3], reverse=True)[:12]
+                 key=lambda x: x[3], reverse=True)[:8]
     filler = sorted([x for x in scored if x[3] < 30],
-                    key=lambda x: x[3], reverse=True)[:3]
+                    key=lambda x: x[3], reverse=True)[:2]
     kept = hot + filler
     dropped = len(scored) - len(kept)
     print(f"[prefilter] {len(scored)} titles -> keep {len(kept)} "
@@ -1369,23 +1365,19 @@ def run_poster():
         pending = con.execute("SELECT COUNT(*) FROM digests WHERE posted=0").fetchone()[0]
         print(f"[poster] posted ✓  ({pending} still pending)")
 
-        # Also post a Reel — but ONLY for strong stories (score gate).
-        # Reel-per-post tripped Facebook's spam rate-limit on the new page.
-        score = story.get("interest_score") or 0
+        # Every posted story gets a Reel: at 6 posts/day (+6 reels = 12
+        # actions/day) we're far under the spam threshold, so no score gate.
         if POST_REELS and REELS_AVAILABLE and card_path:
-            if score < REEL_MIN_SCORE:
-                print(f"[poster] reel skipped (score {score} < {REEL_MIN_SCORE})")
-            else:
-                try:
-                    h = hashlib.md5(story["url"].encode()).hexdigest()[:8]
-                    reel_path = make_reel(card_path, out_dir="reels",
-                                          filename=f"reel_{h}.mp4")
-                    if reel_path:
-                        post_reel_to_facebook(item, reel_path, token, page_id)
-                    else:
-                        print("[poster] reel render returned nothing")
-                except Exception as re:
-                    print(f"[poster] reel step failed: {re}")
+            try:
+                h = hashlib.md5(story["url"].encode()).hexdigest()[:8]
+                reel_path = make_reel(card_path, out_dir="reels",
+                                      filename=f"reel_{h}.mp4")
+                if reel_path:
+                    post_reel_to_facebook(item, reel_path, token, page_id)
+                else:
+                    print("[poster] reel render returned nothing")
+            except Exception as re:
+                print(f"[poster] reel step failed: {re}")
     else:
         print("[poster] post failed — left in queue for next hour")
 

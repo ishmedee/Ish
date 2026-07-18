@@ -73,40 +73,6 @@ def fetch_forecast():
         return None
 
 
-def write_advice(client, fc, label):
-    """Ask Claude for a short Mongolian weather post with dress/umbrella tips."""
-    prompt = (
-        "Чи Монголын цаг агаарын товч мэдээ бичдэг. Улаанбаатар хотын "
-        "өнөөдрийн цаг агаар:\n"
-        f"- Хамгийн их: {fc['tmax']}°C, хамгийн бага: {fc['tmin']}°C\n"
-        f"- Байдал: {label}\n"
-        f"- Хур тунадас: {fc['precip']} мм\n"
-        f"- Салхи: {fc['wind']} км/ц\n\n"
-        "2-3 өгүүлбэрээр найрсаг, тодорхой мэдээ бич: өнөөдөр яаж хувцаслах "
-        "(дулаан/сэрүүн хувцас), шүхэр авах эсэх, салхинаас болгоомжлох эсэхийг "
-        "зөвлө. Хэт албан биш, дотуухан аястай.\n\n"
-        "ЧУХАЛ — дүрмийн зөв, байгалийн монгол хэл бичнэ:\n"
-        "• Хувцас, эд зүйлийн тухайд 'авч явах' гэж бич, 'дагуулах' гэж "
-        "БИЧИХГҮЙ (дагуулах нь хүн/амьтанд хэрэглэнэ).\n"
-        "• Өгүүлбэрийн эзэн бол 'өдөр дулаан' гэж бич, 'өдрийн дулаан' гэж "
-        "эзэмшлийн хэлбэрээр БИЧИХГҮЙ.\n"
-        "• Товч, ойлгомжтой, алдаагүй өгүүлбэр.\n\n"
-        "ЗӨВХӨН текстээ бич, өөр юу ч биш."
-    )
-    try:
-        msg = client.messages.create(
-            model="claude-sonnet-4-6", max_tokens=250,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return "".join(b.text for b in msg.content if b.type == "text").strip()
-    except Exception as e:
-        print(f"[weather] advice failed: {e}")
-        # fallback text so the post still works
-        umb = " Шүхэр аваарай." if fc["precip"] >= 1 else ""
-        return (f"Өнөөдөр Улаанбаатарт {fc['tmin']}–{fc['tmax']}°C, {label.lower()}."
-                f"{umb} Цаг агаарт тохирсон хувцас өмсөөрэй.")
-
-
 def _bg_for(key):
     """Return a background image path for the condition, or None."""
     for ext in ("jpg", "jpeg", "png", "webp"):
@@ -116,18 +82,18 @@ def _bg_for(key):
     return None
 
 
-def make_weather_post(client, out_dir="cards"):
+def make_weather_post(client=None, out_dir="cards"):
     """
-    Build the morning weather card + caption.
-    Returns (card_path, caption) or (None, None) on failure.
+    Build the morning weather card. No caption, no Claude call — the card
+    is self-contained (temp, condition, wind, precip, date).
+    `client` is accepted for backward compatibility but unused.
+    Returns (card_path, "") or (None, "") on failure.
     """
     fc = fetch_forecast()
     if not fc:
-        return None, None
+        return None, ""
     label, bg_key = _condition(fc["code"], fc["tmax"])
-    advice = write_advice(client, fc, label)
 
-    # Render the card (weather-specific renderer in card.py)
     try:
         from card import make_weather_card
         bg = _bg_for(bg_key)
@@ -140,19 +106,9 @@ def make_weather_post(client, out_dir="cards"):
         print(f"[weather] card render failed: {e}")
         card_path = None
 
-    # Compose caption
-    date_h = datetime.now(UB_TZ).strftime("%m сарын %d")
-    caption = (
-        f"🌤 Өнөөдрийн цаг агаар — {date_h}\n\n"
-        f"Улаанбаатар: {fc['tmin']}° — {fc['tmax']}°C, {label}\n\n"
-        f"{advice}\n\n"
-        "#Иш #цагагаар #Улаанбаатар"
-    )
-    return card_path, caption
+    return card_path, ""
 
 
 if __name__ == "__main__":
-    from anthropic import Anthropic
-    p, c = make_weather_post(Anthropic(), out_dir=".")
+    p, _ = make_weather_post(out_dir=".")
     print("card:", p)
-    print("caption:\n", c)

@@ -1402,11 +1402,11 @@ def run_weather():
         return
     client = Anthropic()
     card_path, caption = make_weather_post(client, out_dir="cards")
-    if not card_path or not caption:
-        print("[weather] could not build weather post — skipping")
+    if not card_path:
+        print("[weather] could not build weather card — skipping")
         return
-    # post the weather card with its own caption (bypass build_caption)
-    ok = _post_card_with_caption(card_path, caption, token, page_id)
+    # post the card image only — no caption (the card is self-contained)
+    ok = _post_card_with_caption(card_path, "", token, page_id)
     print("[weather] posted ✓" if ok else "[weather] post failed")
 
 

@@ -460,8 +460,8 @@ def collect_from_listing(src, con):
 
 
 def collect_candidates(con):
-    """Pull all sources, return list of new (source, title, url) tuples."""
-    candidates = []
+    """Pull all sources and return up to 40 source-balanced candidates."""
+    source_batches = []
     for src in SOURCES:
         try:
             if src.get("rss"):
@@ -470,14 +470,29 @@ def collect_candidates(con):
                 fresh = collect_from_listing(src, con)
             else:
                 continue
-            candidates.extend(fresh)
+            source_batches.append(fresh)
             print(f"[collect] {src['name']}: {len(fresh)} new")
         except Exception as e:
             print(f"[collect] {src['name']} FAILED: {e}")
-    # No early truncation: the title prefilter is the cost gate now (one
-    # cheap batch call judges all titles). The old [:12] cap cut in source
-    # order, silently discarding tovch/eguur political stories every run.
-    return candidates[:40]  # generous safety ceiling only
+
+    # Keep the prefilter input budget at 40 without favoring sources that
+    # appear early in SOURCES. Take one candidate from each source per
+    # round until the cap is reached or every source batch is exhausted.
+    candidates = []
+    round_index = 0
+    while len(candidates) < 40:
+        added = False
+        for batch in source_batches:
+            if round_index >= len(batch):
+                continue
+            candidates.append(batch[round_index])
+            added = True
+            if len(candidates) >= 40:
+                break
+        if not added:
+            break
+        round_index += 1
+    return candidates
 
 
 def fetch_article_text(url, selector, use_proxy=False):

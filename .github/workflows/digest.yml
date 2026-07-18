@@ -8,16 +8,13 @@
 
 name: ish-digest
 
-on:
+"on":
   workflow_dispatch:
     inputs:
       mode:
         description: "collect or post"
         required: false
         default: "post"
-  # keep a schedule as backup, though cron-job.org is the primary trigger
-  schedule:
-    - cron: "0 22 * * 1-5"   # 06:00 UB Mon-Fri (collect) - see note below
 
 permissions:
   contents: write
@@ -35,14 +32,20 @@ jobs:
           sudo apt-get update && sudo apt-get install -y ffmpeg
           pip install requests feedparser beautifulsoup4 anthropic Pillow curl_cffi
 
-      - name: Run Иш agent (${{ github.event.inputs.mode || 'post' }})
+      - name: Run Иш agent
         env:
+          MODE: ${{ github.event.inputs.mode }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
-        run: python agent_ish.py ${{ github.event.inputs.mode || 'post' }}
+        run: |
+          case "$MODE" in
+            collect|post|weather|currency) ;;
+            *) echo "Invalid mode: '$MODE'" >&2; exit 1 ;;
+          esac
+          python agent_ish.py "$MODE"
 
       - name: Save results
         run: |

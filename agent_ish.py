@@ -172,8 +172,9 @@ OUTPUT_JSON = "digest.json"      # the website reads this file
 REQUEST_TIMEOUT = 15
 
 # ── Queue-system settings ─────────────────────────────────────
-MORNING_FRESH_HOUR = 9   # before this hour, poster may use yesterday's
-                         # leftovers (today's 6am batch might be thin)
+MORNING_FRESH_HOUR = 9   # (legacy) kept for reference
+FIRST_COLLECTION_HOUR = 11  # first daily collection runs at 11:00 UB, so
+                            # posts before this must use the prior day's news
 MAX_QUEUE_AGE_DAYS = 5   # drop unposted stories older than this (covers
                          # a Friday story staying usable through Sunday)
 # (REEL_MIN_SCORE removed: at 6 posts/day every post gets a Reel.)
@@ -1035,7 +1036,7 @@ def prefilter_political_titles(client, candidates):
     # capped so the wide candidate net doesn't inflate summarization cost,
     # plus a small filler quota for quiet days.
     hot = sorted([x for x in scored if x[3] >= 30],
-                 key=lambda x: x[3], reverse=True)[:8]
+                 key=lambda x: x[3], reverse=True)[:6]
     filler = sorted([x for x in scored if x[3] < 30],
                     key=lambda x: x[3], reverse=True)[:2]
     kept = hot + filler
@@ -1157,15 +1158,16 @@ def run_collector():
             #   stories dominate the queue, while still allowing a bit of
             #   high-interest non-political news to fill slots on quiet days
             #   (it just scores lower and sinks below politics).
-            # "hot news" interest score, weighted like a social-media
-            # news editor: attention/viral pull leads (40%), political
-            # weight second (35% — still the page identity), real-life
-            # impact third (25%); plus multi-source and economy boosts.
+            # "hot news" interest score, weighted for maximum attention:
+            # viral pull leads hard (48%), political weight second (32% —
+            # the page identity), real impact third (20%). Multi-source
+            # gives only a small nudge (not a preference — a story doesn't
+            # need to be on many sites to be hot).
             imp = max(0, min(100, int(d.get("importance", 50))))
             emo = max(0, min(100, int(d.get("emotional", 50))))
-            multi_boost = min(15, (len(sources) - 1) * 5)
+            multi_boost = min(6, (len(sources) - 1) * 3)
             econ_boost = 8 if d.get("category") == "Эдийн засаг" else 0
-            interest = min(100, round(0.40 * emo + 0.35 * pol + 0.25 * imp)
+            interest = min(100, round(0.48 * emo + 0.32 * pol + 0.20 * imp)
                            + multi_boost + econ_boost)
 
             # No card render here: the poster regenerates the card on its
@@ -1228,7 +1230,6 @@ def pick_story_to_post(con, now):
     Returns (row_dict or None, mode_str).
     """
     today = now.date().isoformat()
-    is_weekend = now.weekday() >= 5
 
     def fetch(where, params):
         return con.execute(
@@ -1247,19 +1248,21 @@ def pick_story_to_post(con, now):
             params,
         ).fetchone()
 
-    if is_weekend:
-        row = fetch("1=1", ())
-        mode = "weekend-stockpile"
-    elif now.hour < MORNING_FRESH_HOUR:
-        row = fetch("collected_date = ?", (today,)) or fetch("collected_date < ?", (today,))
-        mode = "morning"
+    # Same-day posting, 7 days a week (collection now runs weekends too).
+    # But the first collection is at 11:00, while posting starts at 08:00 —
+    # so any slot before FIRST_COLLECTION_HOUR has no same-day news yet and
+    # must draw on the most recent prior day. After that: strictly today's,
+    # falling back to prior only if today's queue is somehow empty.
+    if now.hour < FIRST_COLLECTION_HOUR:
+        row = fetch("collected_date < ?", (today,)) or fetch("collected_date = ?", (today,))
+        mode = "pre-collection-morning"
     else:
         row = fetch("collected_date = ?", (today,))
         if row:
-            mode = "weekday-today"
+            mode = "today"
         else:
             row = fetch("collected_date < ?", (today,))
-            mode = "weekday-fallback-leftover"
+            mode = "fallback-leftover"
 
     if not row:
         return None, mode

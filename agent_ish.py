@@ -20,10 +20,15 @@ import json
 import os
 import re
 import sqlite3
+import socket
 import sys
 import time
 import hashlib
+import ipaddress
+import io
+import warnings
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urljoin, urlparse
 
 import feedparser
 import requests
@@ -166,6 +171,9 @@ MAX_ARTICLES_PER_RUN = 12        # cost & noise control
 MAX_PER_SOURCE = 6               # candidates per outlet per run (prefilter
                                  # is the cost gate, so a wide net is cheap)
 MIN_ARTICLE_CHARS = 400          # skip stubs/photo posts
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_REDIRECTS = 3
+MAX_IMAGE_PIXELS = 40_000_000
 MAX_FETCH_ATTEMPTS = 3           # bounded cross-run retries for fetch failures
 FETCH_RETRY_MAX_AGE_DAYS = 2     # never churn a dead URL beyond this age
 MODEL = "claude-sonnet-4-6" # cheap + good enough for summaries
@@ -1458,39 +1466,161 @@ def pick_story_to_post(con, now):
     return dict(zip(keys, row)), mode
 
 
+def is_safe_public_url(url):
+    """Return True only for HTTP(S) URLs resolving entirely to public IPs."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+            return False
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+        addresses = socket.getaddrinfo(
+            parsed.hostname, port, type=socket.SOCK_STREAM
+        )
+        if not addresses:
+            return False
+        for address in addresses:
+            raw_ip = address[4][0].split("%", 1)[0]
+            if not ipaddress.ip_address(raw_ip).is_global:
+                return False
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _reject_article_image(url, reason):
+    print(f"[poster] ARTICLE IMAGE REJECTED {url}: {reason}")
+    return None
+
+
 def download_article_image(image_url, article_url, out_dir="imgs"):
     """
     Download the article's share image for the card header.
     Validates it's a real, reasonably-sized image (rejects tiny logos,
     favicons, broken files). Returns a local path or None.
     """
+    del article_url  # kept in the public signature for existing callers
+    current_url = image_url
+    response = None
     try:
-        # find the source config to honor its proxy flag
-        use_proxy = False
-        for s in SOURCES:
-            base = s.get("base_url", "")
-            if base and article_url.startswith(base):
-                use_proxy = s.get("use_proxy", False)
-                break
-        r = fetch_html(image_url, timeout=25, use_proxy=use_proxy)
-        if r.status_code != 200 or len(r.content) < 8000:
-            return None
+        redirects = 0
+        while True:
+            # This validates the initial URL and, on the final iteration, the
+            # exact post-redirect URL immediately before it is fetched.
+            if not is_safe_public_url(current_url):
+                return _reject_article_image(
+                    current_url, "unsafe, non-public, or unresolvable URL"
+                )
+            response = requests.get(
+                current_url,
+                headers=HEADERS,
+                timeout=25,
+                allow_redirects=False,
+                stream=True,
+            )
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+                if not location:
+                    return _reject_article_image(
+                        current_url, "redirect response has no Location"
+                    )
+                if redirects >= MAX_IMAGE_REDIRECTS:
+                    return _reject_article_image(
+                        current_url,
+                        f"more than {MAX_IMAGE_REDIRECTS} redirects",
+                    )
+                next_url = urljoin(current_url, location)
+                # Validate before following the hop; requests never sees an
+                # unsafe redirect target.
+                if not is_safe_public_url(next_url):
+                    return _reject_article_image(
+                        next_url, "redirect targets a non-public URL"
+                    )
+                response.close()
+                response = None
+                current_url = next_url
+                redirects += 1
+                continue
+            break
+
+        if response.status_code != 200:
+            return _reject_article_image(
+                current_url, f"HTTP status {response.status_code}"
+            )
+
+        content_type = response.headers.get("Content-Type", "")
+        content_type = content_type.split(";", 1)[0].strip().lower()
+        if not content_type.startswith("image/"):
+            return _reject_article_image(
+                current_url, f"non-image Content-Type {content_type or 'missing'}"
+            )
+
+        content_length = response.headers.get("Content-Length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_IMAGE_BYTES:
+                    return _reject_article_image(
+                        current_url,
+                        f"Content-Length exceeds {MAX_IMAGE_BYTES} bytes",
+                    )
+            except ValueError:
+                pass
+
+        body = io.BytesIO()
+        byte_count = 0
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            byte_count += len(chunk)
+            if byte_count > MAX_IMAGE_BYTES:
+                return _reject_article_image(
+                    current_url,
+                    f"stream exceeded {MAX_IMAGE_BYTES} bytes",
+                )
+            body.write(chunk)
+        if byte_count < 8000:
+            return _reject_article_image(
+                current_url, f"image is only {byte_count} bytes (minimum 8000)"
+            )
+
+        from PIL import Image as _Img
+        _Img.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+        body.seek(0)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", _Img.DecompressionBombWarning)
+                with _Img.open(body) as im:
+                    width, height = im.size
+                    if width * height > MAX_IMAGE_PIXELS:
+                        return _reject_article_image(
+                            current_url,
+                            f"{width}x{height} exceeds {MAX_IMAGE_PIXELS} pixels",
+                        )
+                    if width < 400 or height < 250:
+                        return _reject_article_image(
+                            current_url,
+                            f"{width}x{height} is below minimum 400x250",
+                        )
+                    im.verify()
+        except (_Img.DecompressionBombError,
+                _Img.DecompressionBombWarning) as e:
+            return _reject_article_image(
+                current_url, f"decompression bomb rejected: {e}"
+            )
+
         os.makedirs(out_dir, exist_ok=True)
         h = hashlib.md5(image_url.encode()).hexdigest()[:10]
         path = os.path.join(out_dir, f"img_{h}.jpg")
         with open(path, "wb") as f:
-            f.write(r.content)
-        # validate with Pillow: openable and big enough to be a news photo
-        from PIL import Image as _Img
-        with _Img.open(path) as im:
-            im.verify()
-        with _Img.open(path) as im:
-            if im.width < 400 or im.height < 250:
-                return None
+            f.write(body.getvalue())
         return path
     except Exception as e:
-        print(f"[poster] article image skipped ({e})")
-        return None
+        return _reject_article_image(image_url, f"download error: {e}")
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
 
 
 def run_poster():

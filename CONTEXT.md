@@ -46,21 +46,23 @@ Automated Mongolian news service. Scrapes Mongolian news sites → Claude API fi
 - `MAX_PER_SOURCE = 6` (candidates fetched per source per run)
 - `MAX_ARTICLES_PER_RUN = 12` (legacy, unused; candidate list capped at 40 via source-balanced round-robin in `collect_candidates` — no source-order slicing; prefilter is the real gate)
 - `MIN_ARTICLE_CHARS = 400` (skip stubs)
+- `MAX_FETCH_ATTEMPTS = 3`; `FETCH_RETRY_MAX_AGE_DAYS = 2` (bounded cross-run retry for transient article-fetch failures)
+- `MAX_IMAGE_BYTES = 10MB`; `MAX_IMAGE_REDIRECTS = 3`; `MAX_IMAGE_PIXELS = 40M` (article-image SSRF/resource guards)
 - `FIRST_COLLECTION_HOUR = 11`; `MORNING_FRESH_HOUR = 9` (legacy, unused)
 - `MAX_QUEUE_AGE_DAYS = 5` (drop stale unposted)
-- `POST_REELS = env POST_REELS != "0"`
+- `POST_REELS = env POST_REELS == "1"`
 - `CATEGORIES = ["Улс төр","Эдийн засаг","Нийгэм","Технологи","Спорт","Дэлхий"]`
 - `REEL_MIN_SCORE` — REMOVED (all posts get Reels).
 
 ## SQLite schema — table `digests`
-Columns: `url` (PK), `source`, `category`, `title`, `bullets` (JSON array), `why`, `orig_min`, `published`, `run_at`, `sources` (JSON), `source_count` (int), `all_urls` (JSON), `posted` (0/1), `collected_date` (YYYY-MM-DD), `card_path`, `posted_at`, `interest_score` (int), `full_text` (elaborated caption), `image_url` (article og:image).
-Also table `seen(url)` for dedup of already-processed URLs. Columns are added via idempotent migration loop in `db_init()`.
+Columns: `url` (PK), `source`, `category`, `title`, `bullets` (JSON array), `why`, `orig_min`, `published`, `run_at`, `sources` (JSON), `source_count` (int), `all_urls` (JSON), `posted` (0/1), `collected_date` (YYYY-MM-DD), `card_path`, `posted_at`, `interest_score` (int), `full_text` (elaborated caption), `image_url` (article og:image), `fb_post_id` (confirmed FB feed object id), `reel_posted` (0/1; 1 only after Reel upload confirms), `review_needed` (0/1; 1 = ambiguous feed outcome, quarantined from reposting).
+Also table `seen(url)` for dedup of already-processed URLs, plus `fetch_attempts(url PK, attempts, first_seen)` for bounded cross-run retry state after transient article-fetch failures. Tables are created idempotently and `digests` columns are added via the migration loop in `db_init()`.
 
 ## Collector pipeline (`run_collector`)
 1. `collect_candidates(con)` → all sources → list of `(src_dict, title, url)`, capped at 40 by source-balanced round-robin (one candidate per source per round).
 2. **mark ALL candidates seen BEFORE prefilter** (critical: else rejected titles return every run, waste tokens, block per-source quota).
-3. `prefilter_political_titles(client, candidates)` → ONE batch Claude call rating each title 0–100 "hot news" (халуун мэдээ). Keeps **top 6 hot (score ≥30) + 2 filler (<30)**. Returns `(src,title,url,pol_guess)` tuples. (This is the main cost gate.)
-4. For survivors: `fetch_article_text(url, selector, use_proxy)` → returns `(text, image_url)` where image_url is og:image/twitter:image.
+3. `prefilter_political_titles(client, candidates)` → ONE batch Claude call rating each title 0–100 "hot news" (халуун мэдээ). Keeps **top 6 hot (score ≥30) + 2 filler (<30)**. Returns `(src,title,url,pol_guess)` tuples. On parse error, wrong-length output, or any prefilter exception, the deterministic fallback keeps a source-balanced ≤8 candidates instead of all 40. (This is the main cost gate.)
+4. For survivors: `fetch_article_text(url, selector, use_proxy)` → returns `(text, image_url)` where image_url is og:image/twitter:image. Transient fetch failures (exception, empty text, or `<MIN_ARTICLE_CHARS`) use `fetch_attempts` for bounded cross-run retry: maximum 3 attempts or 2 days from the first failure. Only failed survivors are temporarily removed from `seen`; rejected prefilter titles remain seen.
 5. `cluster_candidates` groups same-event articles; `synthesize_cluster` merges multi-source into one summary.
 6. `summarize` (single) or synth (multi) → JSON via `_parse_json_lenient`. Fields: `title, category, bullets[3], why, full_text, newsworthy, importance(0-100), emotional(0-100), political(0-100), mongolia_related(bool), block(bool)`. **max_tokens=2200** (was 900/1000 — caused truncation that killed stories).
 7. Filters: skip not-newsworthy, skip `block`, skip foreign not `mongolia_related`.
@@ -89,9 +91,11 @@ interest = min(100, round(0.48*emo + 0.32*pol + 0.20*imp) + multi_boost + econ_b
 - Select single highest `interest_score` unposted story for the slot. Ordering: `interest_score DESC, (economy first among ties), source_count DESC, collected_date DESC`.
 - Same-day: `now.hour < FIRST_COLLECTION_HOUR(11)` → prior day; else strictly `collected_date=today`, fallback prior only if today empty.
 - Regenerate card ON poster machine (collector cards don't survive across runners — collector-side render was REMOVED as dead work).
-- If `image_url`: `download_article_image` (validate: openable, ≥400×250, ≥8KB) → composite as **full-card darkened background** (blend 0.62, light text palette, NO photo credit line — source is in footer).
+- If `image_url`: `download_article_image` uses plain `requests` (not curl_cffi), requires HTTP(S) resolving only to public IPs, and revalidates every manual redirect. It requires `image/*`, streams with a 10MB cap, rejects over 40MP, and keeps the existing openable/≥400×250/≥8KB gates. Any rejection returns `None`, so the card and post continue without a photo; accepted photos become the **full-card darkened background** (blend 0.62, light text palette, NO photo credit line — source is in footer).
 - `post_one_to_facebook` (2-step: upload photo published=false → attach to /feed with caption).
-- Then `make_reel` + `post_reel_to_facebook` (3-phase FB Reel upload) for EVERY post.
+- On confirmed feed success, `run_poster` commits `posted=1`, `posted_at`, and `fb_post_id` **before** any Reel work.
+- Reel state is separate: `make_reel` + `post_reel_to_facebook` gets one attempt only; confirmation sets `reel_posted=1`, while failure leaves `reel_posted=0` without raising or retrying.
+- Ambiguous feed failures (timeout, lost connection after send, or 2xx without an id) leave `posted=0`, set `review_needed=1`, and are excluded by `pick_story_to_post`. Clean failures leave `review_needed=0` and stay queued for safe retry.
 - `build_caption`: title + `full_text` (2-3 paragraphs) + bullets + "💡 Яагаад чухал вэ? {why}" + source + link + `#Иш #мэдээ #улстөр`. Falls back to bullets-only if no full_text (old queued items).
 
 ## Sources (10 active; list of dicts in agent_ish.py SOURCES)
@@ -110,7 +114,7 @@ Each dict: `name`, one of `rss` or `listing`, `link_pattern` (regex), `base_url`
 - Posted via `_post_card_with_caption(card_path, "", ...)` (empty message).
 
 ## Currency (`currency.py`, mode `currency`)
-- Source ladder (`RATE_URLS`): **monxansh.appspot.com/xansh.json?currency=USD|EUR|CNY|RUB|JPY|KRW** (community JSON mirror — PRIMARY working source), then new mongolbank.mn (JS-rendered, usually empty). old.mongolbank.mn DNS is DEAD.
+- Source ladder (`RATE_URLS`, actual order): two **old.mongolbank.mn** HTML endpoints first (DNS currently dead), then **monxansh.appspot.com/xansh.json?currency=USD|EUR|CNY|RUB|JPY|KRW** (community JSON mirror — primary working source), then new mongolbank.mn (JS-rendered, usually empty).
 - `fetch_rates()`: tries each URL, handles BOTH JSON (`_extract_from_json` walks arbitrary structure) and HTML (`_extract_from_text` regex code+number). Every value **range-checked** per currency (USD 2500-6000, EUR 2800-7000, CNY 350-900, RUB 15-80, JPY 12-45, KRW 1.2-5.0). If <3 parse → **return None, refuse to post** (never post wrong rates).
 - Currencies: USD,EUR,CNY,RUB,JPY,KRW. No Claude call (free).
 - Dependency risk: monxansh is 3rd-party; if down, currency silently skips.
@@ -126,9 +130,10 @@ Repairs truncation: strips ```json fences; if invalid, trims to last `}`; else c
 
 ## Bugs already fixed (don't reintroduce)
 - **mark_seen**: must mark ALL candidates seen BEFORE prefilter, not after (else infinite re-processing).
-- **Source-order cap**: never slice candidates in source order before scoring. Keep the 40-title prefilter budget source-balanced by round-robin so every source is represented before earlier sources receive another slot.
+- **[B-02] Source-order cap regression re-fixed**: never slice candidates in source order before scoring. Keep the 40-title prefilter budget source-balanced by round-robin so every source is represented before earlier sources receive another slot.
 - **max_tokens too low** (900/1000) truncated JSON → lost stories. Now 2200 in both `summarize` and `synthesize_cluster`.
-- **Stray GitHub schedule** in digest.yml removed (would fire rogue 6am post).
+- **[B-04] Stray GitHub schedule regression re-fixed**: `workflow_dispatch` is the only trigger; the rogue native cron was removed.
+- **[E-02] Workflow mode-input shell injection**: bind dispatch input through quoted `$MODE` and allowlist only `collect|post|weather|currency` before invoking Python.
 - **Collector card render** removed (poster always regenerates; was dead work).
 - **Currency**: old.mongolbank.mn dead → use monxansh mirror.
 

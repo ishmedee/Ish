@@ -183,8 +183,8 @@ REQUEST_TIMEOUT = 15
 
 # ── Queue-system settings ─────────────────────────────────────
 MORNING_FRESH_HOUR = 9   # (legacy) kept for reference
-FIRST_COLLECTION_HOUR = 11  # first daily collection runs at 11:00 UB, so
-                            # posts before this must use the prior day's news
+FIRST_COLLECTION_HOUR = 7  # first daily collection runs at 06:00 UB, so
+                            # posts before 07:00 use the prior day's news
 MAX_QUEUE_AGE_DAYS = 5   # drop unposted stories older than this (covers
                          # a Friday story staying usable through Sunday)
 # (REEL_MIN_SCORE removed: at 6 posts/day every post gets a Reel.)

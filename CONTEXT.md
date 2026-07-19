@@ -27,18 +27,18 @@ Automated Mongolian news service. Scrapes Mongolian news sites → Claude API fi
 - `weather` → `run_weather()`
 - `currency` → `run_currency()`
 
-## Current schedule (cron-job.org, Asia/Ulaanbaatar) — **collector & poster must NOT share a minute** (both write towch.db and commit it; same-minute = git collision)
+## Current schedule (cron-job.org, Asia/Ulaanbaatar) — overlapping runs are serialized by the **[C-04] `ish-digest` workflow concurrency group** (`cancel-in-progress: false`), so they queue instead of colliding
 | Job | Cron | Times |
 |-----|------|-------|
 | Weather | `45 6 * * *` | 06:45 daily |
 | Currency | `50 6 * * 1-5` | 06:50 weekdays (rates don't change weekends) |
-| Poster | `0 8,11,13,16,19,21 * * *` | 08,11,13,16,19,21 on the hour |
-| Collector | `30 11,16 * * *` | 11:30, 16:30 daily |
+| Poster | `0 7,11,15,17,18,19 * * *` | 07,11,15,17,18,19 on the hour |
+| Collector | `0 6,14 * * *` | 06:00, 14:00 daily |
 
 ## Operating strategy (current, final)
 - **6 posts/day**, every post also gets a **Reel** (no score gate — ~12 FB actions/day, under the spam limit that was hit at ~64/day).
-- **Collect 2×/day** (11:30, 16:30), **7 days/week** incl. weekends.
-- **Strict same-day posting**, except the 08:00 slot (runs before first collection at 11:30) uses most-recent prior day so it's not empty. Controlled by `FIRST_COLLECTION_HOUR = 11` in `pick_story_to_post`.
+- **Collect 2×/day** (06:00, 14:00), **7 days/week** incl. weekends.
+- **Strict same-day posting** from the 07:00 slot onward, fed by the 06:00 collection. Only posts before 07:00 use the most-recent prior day. Controlled by `FIRST_COLLECTION_HOUR = 7` in `pick_story_to_post`.
 - Editorial: Mongolian **politics primary**; secondary = hot social + Mongolian economy (economy is preferred filler). Foreign news dropped unless directly Mongolia-related.
 
 ## Key constants (agent_ish.py)
@@ -48,7 +48,7 @@ Automated Mongolian news service. Scrapes Mongolian news sites → Claude API fi
 - `MIN_ARTICLE_CHARS = 400` (skip stubs)
 - `MAX_FETCH_ATTEMPTS = 3`; `FETCH_RETRY_MAX_AGE_DAYS = 2` (bounded cross-run retry for transient article-fetch failures)
 - `MAX_IMAGE_BYTES = 10MB`; `MAX_IMAGE_REDIRECTS = 3`; `MAX_IMAGE_PIXELS = 40M` (article-image SSRF/resource guards)
-- `FIRST_COLLECTION_HOUR = 11`; `MORNING_FRESH_HOUR = 9` (legacy, unused)
+- `FIRST_COLLECTION_HOUR = 7`; `MORNING_FRESH_HOUR = 9` (legacy, unused)
 - `MAX_QUEUE_AGE_DAYS = 5` (drop stale unposted)
 - `POST_REELS = env POST_REELS == "1"`
 - `CATEGORIES = ["Улс төр","Эдийн засаг","Нийгэм","Технологи","Спорт","Дэлхий"]`
@@ -89,7 +89,7 @@ interest = min(100, round(0.48*emo + 0.32*pol + 0.20*imp) + multi_boost + econ_b
 
 ## Poster (`run_poster` + `pick_story_to_post`)
 - Select single highest `interest_score` unposted story for the slot. Ordering: `interest_score DESC, (economy first among ties), source_count DESC, collected_date DESC`.
-- Same-day: `now.hour < FIRST_COLLECTION_HOUR(11)` → prior day; else strictly `collected_date=today`, fallback prior only if today empty.
+- Same-day: `now.hour < FIRST_COLLECTION_HOUR(7)` → prior day; else strictly `collected_date=today`, fallback prior only if today empty.
 - Regenerate card ON poster machine (collector cards don't survive across runners — collector-side render was REMOVED as dead work).
 - If `image_url`: `download_article_image` uses plain `requests` (not curl_cffi), requires HTTP(S) resolving only to public IPs, and revalidates every manual redirect. It requires `image/*`, streams with a 10MB cap, rejects over 40MP, and keeps the existing openable/≥400×250/≥8KB gates. Any rejection returns `None`, so the card and post continue without a photo; accepted photos become the **full-card darkened background** (blend 0.62, light text palette, NO photo credit line — source is in footer).
 - `post_one_to_facebook` (2-step: upload photo published=false → attach to /feed with caption).

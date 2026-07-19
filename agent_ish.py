@@ -166,6 +166,8 @@ MAX_ARTICLES_PER_RUN = 12        # cost & noise control
 MAX_PER_SOURCE = 6               # candidates per outlet per run (prefilter
                                  # is the cost gate, so a wide net is cheap)
 MIN_ARTICLE_CHARS = 400          # skip stubs/photo posts
+MAX_FETCH_ATTEMPTS = 3           # bounded cross-run retries for fetch failures
+FETCH_RETRY_MAX_AGE_DAYS = 2     # never churn a dead URL beyond this age
 MODEL = "claude-sonnet-4-6" # cheap + good enough for summaries
 DB_PATH = "towch.db"
 OUTPUT_JSON = "digest.json"      # the website reads this file
@@ -281,6 +283,11 @@ def db_init():
         url TEXT PRIMARY KEY,
         first_seen TEXT
     )""")
+    con.execute("""CREATE TABLE IF NOT EXISTS fetch_attempts (
+        url TEXT PRIMARY KEY,
+        attempts INTEGER NOT NULL,
+        first_seen TEXT NOT NULL
+    )""")
     con.execute("""CREATE TABLE IF NOT EXISTS digests (
         url TEXT PRIMARY KEY,
         source TEXT, category TEXT, title TEXT,
@@ -318,6 +325,79 @@ def mark_seen(con, url):
         "INSERT OR IGNORE INTO seen VALUES (?, ?)",
         (url, datetime.now(UB_TZ).isoformat()),
     )
+    con.commit()
+
+
+def record_fetch_failure(con, url, now):
+    """Record a survivor fetch failure and decide whether it may retry."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UB_TZ)
+
+    row = con.execute(
+        "SELECT attempts, first_seen FROM fetch_attempts WHERE url=?",
+        (url,),
+    ).fetchone()
+    if row is None:
+        attempts = 1
+        first_seen_raw = now.isoformat()
+        con.execute(
+            "INSERT INTO fetch_attempts (url, attempts, first_seen) "
+            "VALUES (?, ?, ?)",
+            (url, attempts, first_seen_raw),
+        )
+    else:
+        attempts = row[0] + 1
+        first_seen_raw = row[1]
+        # Deliberately update only attempts: the retry age must never reset.
+        con.execute(
+            "UPDATE fetch_attempts SET attempts=? WHERE url=?",
+            (attempts, url),
+        )
+
+    try:
+        first_seen = datetime.fromisoformat(first_seen_raw)
+        if first_seen.tzinfo is None:
+            first_seen = first_seen.replace(tzinfo=UB_TZ)
+        age = now - first_seen
+        age_days = max(0.0, age.total_seconds() / 86400)
+        age_expired = age > timedelta(days=FETCH_RETRY_MAX_AGE_DAYS)
+    except (TypeError, ValueError):
+        # Corrupt retry state must fail closed instead of churning forever.
+        age_days = float("nan")
+        age_expired = True
+
+    if attempts >= MAX_FETCH_ATTEMPTS or age_expired:
+        con.execute(
+            "INSERT OR IGNORE INTO seen (url, first_seen) VALUES (?, ?)",
+            (url, now.isoformat()),
+        )
+        con.execute("DELETE FROM fetch_attempts WHERE url=?", (url,))
+        con.commit()
+        age_text = "unknown" if age_days != age_days else f"{age_days:.1f} days"
+        print(
+            f"[fetch-retry] GIVING UP {url} after {attempts} attempts / "
+            f"age {age_text}"
+        )
+        return "giveup"
+
+    # Only a failed prefilter survivor reaches this deletion. Rejected titles
+    # never enter this helper and remain permanently marked seen.
+    con.execute("DELETE FROM seen WHERE url=?", (url,))
+    con.commit()
+    print(
+        f"[fetch-retry] transient fetch fail, will retry "
+        f"(attempt {attempts}/{MAX_FETCH_ATTEMPTS}): {url}"
+    )
+    return "retry"
+
+
+def clear_fetch_retry(con, url):
+    """Clear retry state after a survivor fetch succeeds."""
+    con.execute(
+        "INSERT OR IGNORE INTO seen (url, first_seen) VALUES (?, ?)",
+        (url, datetime.now(UB_TZ).isoformat()),
+    )
+    con.execute("DELETE FROM fetch_attempts WHERE url=?", (url,))
     con.commit()
 
 
@@ -1193,14 +1273,18 @@ def run_collector():
         try:
             text, image_url = fetch_article_text(url, src["article_selector"],
                                                  use_proxy=src.get("use_proxy", False))
-            if len(text) < MIN_ARTICLE_CHARS:
-                print(f"[skip] too short: {title[:50]}")
-                continue
-            articles.append({"src": src["name"], "title": title,
-                             "url": url, "text": text,
-                             "image_url": image_url})
         except Exception as e:
             print(f"[fail] {url}: {e}")
+            record_fetch_failure(con, url, now)
+            continue
+        if not text or len(text) < MIN_ARTICLE_CHARS:
+            print(f"[skip] too short: {title[:50]}")
+            record_fetch_failure(con, url, now)
+            continue
+        clear_fetch_retry(con, url)
+        articles.append({"src": src["name"], "title": title,
+                         "url": url, "text": text,
+                         "image_url": image_url})
 
     if not articles:
         print("[collector] nothing usable after fetch/filter")

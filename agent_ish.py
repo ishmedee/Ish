@@ -1057,6 +1057,38 @@ def prefilter_political_titles(client, candidates):
     """
     if not candidates:
         return []
+
+    def fallback(reason):
+        """Return a deterministic source-balanced subset capped at eight."""
+        batches_by_source = {}
+        for candidate in candidates:
+            src = candidate[0]
+            source_key = (
+                str(src.get("name", "")),
+                str(src.get("rss") or src.get("listing") or ""),
+            )
+            batches_by_source.setdefault(source_key, []).append(candidate)
+
+        batches = list(batches_by_source.values())
+        kept = []
+        round_index = 0
+        while len(kept) < 8:
+            added = False
+            for batch in batches:
+                if round_index >= len(batch):
+                    continue
+                kept.append((*batch[round_index], None))
+                added = True
+                if len(kept) >= 8:
+                    break
+            if not added:
+                break
+            round_index += 1
+
+        print(f"[prefilter] FALLBACK — {reason}; kept {len(kept)} of "
+              f"{len(candidates)} source-balanced candidates (cap 8)")
+        return kept
+
     titles = [t for (_s, t, _u) in candidates]
     numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(titles))
     prompt = (
@@ -1086,11 +1118,13 @@ def prefilter_political_titles(client, candidates):
         raw = "".join(b.text for b in msg.content if b.type == "text")
         scores = _parse_json_lenient(raw)
         if not isinstance(scores, list) or len(scores) != len(candidates):
-            print("[prefilter] unexpected response, keeping all")
-            return [(s, t, u, None) for (s, t, u) in candidates]
+            received = len(scores) if isinstance(scores, list) else "non-list"
+            return fallback(
+                f"wrong score count/type (expected {len(candidates)}, "
+                f"received {received})"
+            )
     except Exception as e:
-        print(f"[prefilter] failed, keeping all: {e}")
-        return [(s, t, u, None) for (s, t, u) in candidates]
+        return fallback(f"Claude/JSON failure: {type(e).__name__}: {e}")
 
     scored = []
     for (src, title, url), sc in zip(candidates, scores):

@@ -299,7 +299,10 @@ def db_init():
                       ("posted_at", "TEXT"),                 # when it was posted
                       ("interest_score", "INTEGER DEFAULT 50"),  # engagement ranking
                       ("full_text", "TEXT"),                 # elaborated caption
-                      ("image_url", "TEXT")]:                # article og:image
+                      ("image_url", "TEXT"),                 # article og:image
+                      ("fb_post_id", "TEXT"),                # confirmed FB feed object id
+                      ("reel_posted", "INTEGER DEFAULT 0"),  # 1 only after Reel confirms
+                      ("review_needed", "INTEGER DEFAULT 0")]:  # ambiguous feed outcome
         if col not in cols:
             con.execute(f"ALTER TABLE digests ADD COLUMN {col} {decl}")
     con.commit()
@@ -734,25 +737,44 @@ def build_caption(item):
 
 
 def post_one_to_facebook(item, card_path, token, page_id):
-    """Post ONE story's card as a feed post. Returns True on success."""
+    """
+    Post ONE story's card as a feed post.
+
+    Returns {"status": "success|clean_failure|ambiguous_failure",
+             "fb_post_id": str|None}.
+    Only the public /feed request can be ambiguous; an unpublished-photo
+    upload failure is clean because no feed post was attempted.
+    """
     if not card_path or not os.path.exists(card_path):
         print(f"[fb] no card file for: {item['title'][:40]}")
-        return False
+        return {"status": "clean_failure", "fb_post_id": None}
     caption = build_caption(item)
+
+    # Step 1: upload photo unpublished. Failure here cannot create a public
+    # feed post, so it is always safe for the queue to retry naturally.
     try:
-        # Step 1: upload photo unpublished
         with open(card_path, "rb") as img:
             up = requests.post(
                 f"{FB_API}/{page_id}/photos",
                 data={"published": "false", "access_token": token},
                 files={"source": img}, timeout=60,
             )
-        photo_id = up.json().get("id")
+        try:
+            up_body = up.json()
+        except ValueError:
+            up_body = {}
+        photo_id = up_body.get("id")
         if not photo_id:
-            err = up.json().get("error", {}).get("message", up.text[:200])
+            err = up_body.get("error", {}).get("message", up.text[:200])
             print(f"[fb] upload FAILED ({up.status_code}): {err}")
-            return False
-        # Step 2: create feed post with photo attached
+            return {"status": "clean_failure", "fb_post_id": None}
+    except Exception as e:
+        print(f"[fb] unpublished photo upload FAILED: {e}")
+        return {"status": "clean_failure", "fb_post_id": None}
+
+    # Step 2: create the public feed post. A timeout or lost connection after
+    # sending is ambiguous: Facebook may have accepted it despite no response.
+    try:
         r = requests.post(
             f"{FB_API}/{page_id}/feed",
             data={"message": caption,
@@ -760,15 +782,46 @@ def post_one_to_facebook(item, card_path, token, page_id):
                   "access_token": token},
             timeout=60,
         )
-        if r.status_code == 200 and r.json().get("id"):
-            print(f"[fb] posted to feed: {item['title'][:50]}")
-            return True
-        err = r.json().get("error", {}).get("message", r.text[:200])
-        print(f"[fb] feed post FAILED ({r.status_code}): {err}")
-        return False
+    except requests.exceptions.Timeout as e:
+        print(f"[fb] AMBIGUOUS feed timeout — REVIEW REQUIRED: {e}")
+        return {"status": "ambiguous_failure", "fb_post_id": None}
+    except requests.exceptions.ConnectionError as e:
+        message = str(e).lower()
+        clean_markers = (
+            "connection refused",
+            "failed to establish a new connection",
+            "getaddrinfo failed",
+            "name or service not known",
+            "network is unreachable",
+        )
+        if any(marker in message for marker in clean_markers):
+            print(f"[fb] feed connection rejected before response: {e}")
+            return {"status": "clean_failure", "fb_post_id": None}
+        print(f"[fb] AMBIGUOUS feed connection loss — REVIEW REQUIRED: {e}")
+        return {"status": "ambiguous_failure", "fb_post_id": None}
+    except requests.exceptions.RequestException as e:
+        print(f"[fb] AMBIGUOUS feed request failure — REVIEW REQUIRED: {e}")
+        return {"status": "ambiguous_failure", "fb_post_id": None}
     except Exception as e:
-        print(f"[fb] error posting {item['title'][:40]}: {e}")
-        return False
+        print(f"[fb] AMBIGUOUS feed failure — REVIEW REQUIRED: {e}")
+        return {"status": "ambiguous_failure", "fb_post_id": None}
+
+    try:
+        body = r.json()
+    except ValueError:
+        body = {}
+    if 200 <= r.status_code < 300:
+        post_id = body.get("id")
+        if post_id:
+            print(f"[fb] posted to feed: {item['title'][:50]} ({post_id})")
+            return {"status": "success", "fb_post_id": post_id}
+        print("[fb] AMBIGUOUS successful response without post id — "
+              "REVIEW REQUIRED")
+        return {"status": "ambiguous_failure", "fb_post_id": None}
+
+    err = body.get("error", {}).get("message", r.text[:200])
+    print(f"[fb] feed post REJECTED ({r.status_code}): {err}")
+    return {"status": "clean_failure", "fb_post_id": None}
 
 
 def post_reel_to_facebook(item, reel_path, token, page_id):
@@ -1252,7 +1305,7 @@ def pick_story_to_post(con, now):
             "source_count, card_path, collected_date, full_text, interest_score, "
             "image_url "
             "FROM digests "
-            "WHERE posted=0 AND " + where +
+            "WHERE posted=0 AND COALESCE(review_needed, 0)=0 AND " + where +
             # Primary: highest interest score (politics dominates).
             # Tie/filler preference: among similar scores, economy stories
             # (Эдийн засаг) come first — so when strong politics runs out,
@@ -1375,29 +1428,66 @@ def run_poster():
     else:
         card_path = story["card_path"]  # fallback to stored path
 
-    ok = post_one_to_facebook(item, card_path, token, page_id)
-    if ok:
-        con.execute("UPDATE digests SET posted=1, posted_at=? WHERE url=?",
-                    (now.isoformat(), story["url"]))
+    feed_result = post_one_to_facebook(item, card_path, token, page_id)
+    feed_status = feed_result.get("status")
+    if feed_status == "success":
+        fb_post_id = feed_result["fb_post_id"]
+        # Commit confirmed feed state before any Reel work. If rendering or
+        # uploading the Reel fails, the feed must never return to the queue.
+        con.execute(
+            "UPDATE digests "
+            "SET posted=1, posted_at=?, fb_post_id=?, reel_posted=0, "
+            "review_needed=0 WHERE url=?",
+            (now.isoformat(), fb_post_id, story["url"]),
+        )
         con.commit()
         pending = con.execute("SELECT COUNT(*) FROM digests WHERE posted=0").fetchone()[0]
-        print(f"[poster] posted ✓  ({pending} still pending)")
+        print(f"[poster] feed posted ✓ id={fb_post_id} "
+              f"({pending} still pending)")
 
         # Every posted story gets a Reel: at 6 posts/day (+6 reels = 12
         # actions/day) we're far under the spam threshold, so no score gate.
+        # This is a single attempt: failed Reels are logged but never retried.
         if POST_REELS and REELS_AVAILABLE and card_path:
+            reel_ok = False
             try:
                 h = hashlib.md5(story["url"].encode()).hexdigest()[:8]
                 reel_path = make_reel(card_path, out_dir="reels",
                                       filename=f"reel_{h}.mp4")
                 if reel_path:
-                    post_reel_to_facebook(item, reel_path, token, page_id)
+                    reel_ok = post_reel_to_facebook(
+                        item, reel_path, token, page_id
+                    )
                 else:
-                    print("[poster] reel render returned nothing")
+                    print("[poster] REEL FAILED: render returned nothing; "
+                          "no automatic retry")
             except Exception as re:
-                print(f"[poster] reel step failed: {re}")
+                print(f"[poster] REEL FAILED: {re}; no automatic retry")
+            if reel_ok:
+                con.execute(
+                    "UPDATE digests SET reel_posted=1 WHERE url=?",
+                    (story["url"],),
+                )
+                con.commit()
+                print("[poster] reel state saved ✓")
+            else:
+                print("[poster] REEL NOT POSTED; feed remains posted and "
+                      "will not be retried")
+    elif feed_status == "ambiguous_failure":
+        con.execute(
+            "UPDATE digests SET review_needed=1, posted=0 WHERE url=?",
+            (story["url"],),
+        )
+        con.commit()
+        print("[poster] REVIEW REQUIRED: feed outcome ambiguous; story "
+              "quarantined from automatic reposting")
     else:
-        print("[poster] post failed — left in queue for next hour")
+        con.execute(
+            "UPDATE digests SET review_needed=0, posted=0 WHERE url=?",
+            (story["url"],),
+        )
+        con.commit()
+        print("[poster] clean feed failure — left in queue for next run")
 
 
 # ──────────────────────────────────────────────────────────────

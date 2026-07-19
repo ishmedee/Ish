@@ -16,6 +16,10 @@ name: ish-digest
         required: false
         default: "post"
 
+concurrency:
+  group: ish-digest
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -56,9 +60,12 @@ jobs:
           # Robust push with retries. On conflict (concurrent collector/poster
           # run touched towch.db), take OUR freshly-written copy — our run just
           # finished and its DB reflects the latest state including this run's work.
+          push_succeeded=0
           for i in 1 2 3 4 5; do
             if git push 2>/dev/null; then
-              echo "pushed on attempt $i"; break
+              echo "pushed on attempt $i"
+              push_succeeded=1
+              break
             fi
             echo "push attempt $i failed — reconciling with remote"
             git fetch origin main
@@ -68,3 +75,7 @@ jobs:
                    git commit -m "resolve: keep our DB" 2>/dev/null || true; }
             sleep 3
           done
+          if [ "$push_succeeded" -ne 1 ]; then
+            echo "all push attempts failed" >&2
+            exit 1
+          fi

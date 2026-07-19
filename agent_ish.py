@@ -1761,8 +1761,8 @@ def run_weather():
     if not card_path:
         print("[weather] could not build weather card — skipping")
         return
-    # post the card image only — no caption (the card is self-contained)
-    ok = _post_card_with_caption(card_path, "", token, page_id)
+    # post the card image with its deterministic forecast caption
+    ok = _post_card_with_caption(card_path, caption, token, page_id)
     print("[weather] posted ✓" if ok else "[weather] post failed")
 
 

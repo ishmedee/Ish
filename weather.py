@@ -22,6 +22,9 @@ from datetime import datetime, timezone, timedelta
 UB_TZ = timezone(timedelta(hours=8))
 UB_LAT, UB_LON = 47.92, 106.92
 ASSET_WEATHER_DIR = os.path.join(os.path.dirname(__file__), "assets", "weather")
+MONGOLIAN_WEEKDAYS = [
+    "Даваа", "Мягмар", "Лхагва", "Пүрэв", "Баасан", "Бямба", "Ням",
+]
 
 # WMO weather codes -> (mongolian condition label, background key)
 # https://open-meteo.com/en/docs  (weathercode field)
@@ -82,17 +85,32 @@ def _bg_for(key):
     return None
 
 
+def _build_weather_caption(forecast, condition):
+    """Build a deterministic caption from the same dated forecast as the card."""
+    forecast_date = datetime.strptime(forecast["date"], "%Y-%m-%d").date()
+    weekday = MONGOLIAN_WEEKDAYS[forecast_date.weekday()]
+    return (
+        "Өглөөний мэнд! 🌅\n"
+        f"Өнөөдөр {forecast_date.year} оны {forecast_date.month} сарын "
+        f"{forecast_date.day}, {weekday} гараг.\n"
+        f"Улаанбаатар хотод өнөөдөр {condition}, өдөртөө "
+        f"{forecast['tmax']}°C,\n"
+        f"шөнөдөө {forecast['tmin']}°C байна."
+    )
+
+
 def make_weather_post(client=None, out_dir="cards"):
     """
-    Build the morning weather card. No caption, no Claude call — the card
-    is self-contained (temp, condition, wind, precip, date).
+    Build the morning weather card and deterministic forecast caption.
+    No Claude call is made.
     `client` is accepted for backward compatibility but unused.
-    Returns (card_path, "") or (None, "") on failure.
+    Returns (card_path, caption) or (None, "") on fetch failure.
     """
     fc = fetch_forecast()
     if not fc:
         return None, ""
     label, bg_key = _condition(fc["code"], fc["tmax"])
+    caption = _build_weather_caption(fc, label)
 
     try:
         from card import make_weather_card
@@ -106,7 +124,7 @@ def make_weather_post(client=None, out_dir="cards"):
         print(f"[weather] card render failed: {e}")
         card_path = None
 
-    return card_path, ""
+    return card_path, caption
 
 
 if __name__ == "__main__":

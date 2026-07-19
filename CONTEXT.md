@@ -110,8 +110,8 @@ Each dict: `name`, one of `rss` or `listing`, `link_pattern` (regex), `base_url`
 ## Weather (`weather.py`, mode `weather`)
 - `fetch_forecast()`: Open-Meteo `api.open-meteo.com/v1/forecast`, UB lat 47.92/lon 106.92, daily tmax/tmin/precip/weathercode/windmax, tz Asia/Ulaanbaatar. Free, no key.
 - `_condition(code,tmax)` maps WMO code → (label, bg_key ∈ clear/clouds/rain/snow/fog/storm/cold). `_bg_for` looks in `assets/weather/{key}.jpg` (user-supplied; solid brand-blue fallback).
-- `make_weather_post` returns `(card_path, "")` — **card only, NO caption, NO Claude call** (AI-written advice was removed: recurring Mongolian grammar errors + cost). `write_advice` deleted.
-- Posted via `_post_card_with_caption(card_path, "", ...)` (empty message).
+- `make_weather_post` returns `(card_path, caption)` — the card plus a deterministic template containing a morning greeting, forecast date, Mongolian weekday, condition, and max/min temperatures. **NO Claude call**; the old AI-written advice remains removed because of recurring Mongolian grammar errors + cost. `write_advice` stays deleted.
+- Posted via `_post_card_with_caption(card_path, caption, ...)`.
 
 ## Currency (`currency.py`, mode `currency`)
 - Source ladder (`RATE_URLS`, actual order): two **old.mongolbank.mn** HTML endpoints first (DNS currently dead), then **monxansh.appspot.com/xansh.json?currency=USD|EUR|CNY|RUB|JPY|KRW** (community JSON mirror — primary working source), then new mongolbank.mn (JS-rendered, usually empty).

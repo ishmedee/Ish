@@ -84,7 +84,7 @@ interest = min(100, round(0.48*emo + 0.32*pol + 0.20*imp) + multi_boost + econ_b
 
 ## Cross-run dedup (`is_duplicate_of_recent`) — 3 tiers, cost-minimizing
 - Free `_title_similarity` (Jaccard word-overlap, words ≥4 chars).
-- `≥0.60` → duplicate (free). `<0.18` → unique (free, common case). `0.18–0.60` → one short Claude call comparing top ~6 similar recent titles ("same event?").
+- `≥0.60` → duplicate (free). `<0.12` → unique (free, common case). `0.12–0.60` → one short Claude call comparing the new story (title + bullets) against the top ~6 similar recent stories (title + stored bullets, each capped 300 chars). "Same event" explicitly includes rewordings / different emphasised numbers / updated tallies of one incident; genuinely new developments are allowed through. Floor is 0.12 (was 0.18) because AI-retitling + Mongolian suffix morphology push real same-event rewordings down to ~0.15 Jaccard.
 - Compares against last ~40 titles from past 3 days (queued or posted). On error → allow through (safe: rare dup > lost story).
 
 ## Poster (`run_poster` + `pick_story_to_post`)
@@ -136,6 +136,7 @@ Repairs truncation: strips ```json fences; if invalid, trims to last `}`; else c
 - **[E-02] Workflow mode-input shell injection**: bind dispatch input through quoted `$MODE` and allowlist only `collect|post|weather|currency` before invoking Python.
 - **Collector card render** removed (poster always regenerates; was dead work).
 - **Currency**: old.mongolbank.mn dead → use monxansh mirror.
+- **Rewording dedup miss**: the dedup free-exit floor must stay ≤0.12 and the Stage-2 AI check must include bullets (both sides) with the "rewordings/updated tallies = same event" prompt — titles-only + 0.18 floor let the same event post 2-3× (e.g. 2026-07-20 Naadam casualty roundup posted 3× in one day). The ≥0.60 auto-dup gate must NOT be lowered (Trump/Macron greeting pair sits at 0.56 and is genuinely distinct).
 
 ## Cost (per collect run, history): 38¢ → 31¢ (cheap dedup) → 21¢ (title prefilter). Tighter quota (6 hot+2 filler) + 2×/day keeps it low. Weather & currency = $0 (no AI). Prompt caching evaluated = not worth it (unique article text dominates, small cacheable portion).
 

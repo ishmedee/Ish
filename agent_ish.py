@@ -1075,25 +1075,28 @@ def is_duplicate_of_recent(client, con, new_title, new_bullets, days=3):
          call entirely (this is the common case, so most stories cost $0).
       2. Only when there ARE similar-looking candidates do we ask Claude,
          and we send just the top few (not all 40) to keep the prompt short.
+         The check sends bullets alongside titles: rewritten titles about
+         the same event emphasise different numbers/places, so titles alone
+         systematically miss rewordings.
     Returns True if it's a duplicate (should skip).
     """
     cutoff = (datetime.now(UB_TZ).date() - timedelta(days=days)).isoformat()
     rows = con.execute(
-        "SELECT title FROM digests "
+        "SELECT title, bullets FROM digests "
         "WHERE collected_date >= ? OR posted=1 "
         "ORDER BY run_at DESC LIMIT 40", (cutoff,)
     ).fetchall()
-    recent = [r[0] for r in rows if r[0]]
+    recent = [(r[0], r[1]) for r in rows if r[0]]
     if not recent:
         return False
 
     # exact match — free, instant
-    if new_title in recent:
+    if new_title in (t for t, _b in recent):
         return True
 
     # Stage 1: free similarity scoring
     scored = sorted(
-        ((_title_similarity(new_title, t), t) for t in recent),
+        ((_title_similarity(new_title, t), t, b) for t, b in recent),
         key=lambda x: x[0], reverse=True,
     )
     best_sim = scored[0][0] if scored else 0.0
@@ -1103,20 +1106,42 @@ def is_duplicate_of_recent(client, con, new_title, new_bullets, days=3):
     if best_sim >= 0.6:
         return True
     # Very low overlap => clearly different topic; skip the AI call.
-    if best_sim < 0.18:
+    # Floor is 0.12: AI-retitling plus Mongolian suffix morphology push
+    # genuine same-event rewordings down to ~0.15 Jaccard (observed), so
+    # a higher floor lets duplicates exit free without the AI check.
+    if best_sim < 0.12:
         return False
 
     # Stage 2: ambiguous middle ground — ask Claude, but only about the
-    # top candidates (short prompt), not all 40 titles.
-    candidates = [t for sim, t in scored[:6] if sim >= 0.18]
+    # top candidates (short prompt), not all 40 titles. Bullets go along
+    # too: they carry the concrete numbers/places that rewritten titles
+    # omit, which is what lets Claude recognise a reworded same event.
+    def _facts(bullets_json):
+        try:
+            parts = json.loads(bullets_json or "[]")
+            return "; ".join(str(p) for p in parts)[:300]
+        except Exception:
+            return ""
+
+    candidates = [(t, b) for sim, t, b in scored[:6] if sim >= 0.12]
     if not candidates:
         return False
-    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(candidates))
+    lines = []
+    for i, (t, b) in enumerate(candidates):
+        facts = _facts(b)
+        lines.append(f"{i+1}. {t}"
+                     + (f"\n   Баримт: {facts}" if facts else ""))
+    numbered = "\n".join(lines)
+    new_facts = "; ".join(str(p) for p in (new_bullets or []))[:300]
     prompt = (
-        "Доорх 'ШИНЭ мэдээ' нь 'ӨМНӨХ мэдээнүүд'-ийн аль нэгтэй ЯГ ИЖИЛ үйл "
-        "явдлыг өгүүлж байна уу? (өөр өнцөг биш, ижил үйл явдал)\n\n"
-        f"ШИНЭ мэдээ: {new_title}\n\n"
-        f"ӨМНӨХ мэдээнүүд:\n{numbered}\n\n"
+        "Доорх ШИНЭ мэдээ нь ӨМНӨХ мэдээнүүдийн аль нэгтэй ИЖИЛ үйл явдлыг "
+        "дахин мэдээлж байна уу? Өөр найруулгатай, өөр тоо/газар онцолсон, "
+        "эсвэл нэг хэрэг явдлын шинэчилсэн тоо баримт мэдээлсэн ч ИЖИЛ үйл "
+        "явдалд тооцно. Харин цоо шинэ хөгжил, дараагийн тусдаа үйл явдал "
+        "бол ижил биш.\n\n"
+        f"ШИНЭ мэдээ: {new_title}\n"
+        + (f"Баримт: {new_facts}\n" if new_facts else "")
+        + f"\nӨМНӨХ мэдээнүүд:\n{numbered}\n\n"
         "ЗӨВХӨН JSON: {\"duplicate\": true/false}"
     )
     try:

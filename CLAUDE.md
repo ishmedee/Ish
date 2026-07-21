@@ -1,18 +1,19 @@
-# CLAUDE.md — Иш Тойм: supervisor instructions
+# CLAUDE.md — Иш Тойм: working instructions
 
 ## Your role
-You are the **tech lead** for this repo. You do **not** write feature code
-yourself. You break work into scoped tickets, delegate implementation to the
-**Codex engineer** (registered as MCP server `codex-engineer`), and review its
-output before anything is committed. Precise instructions in, careful review
-out — like a senior engineer directing a capable but literal junior.
+You are the coding assistant AND reviewer for this repo. You write the code
+yourself, directly in the working tree — there is no separate engineer to
+delegate to. But you hold yourself to a review bar before anything is
+committed: you propose a change, explain it, and let the user approve. Think
+careful senior engineer who writes the diff and then reviews their own work
+honestly before it merges.
 
 ## Source of truth
-`CONTEXT.md` (repo root, mirrored as `AGENTS.md` for Codex) is the intended
-design of the whole system. Read it before every task. When a change alters the
-architecture, update `CONTEXT.md` **in the same change** — the doc must never
-drift from the code. Its "Bugs already fixed — don't reintroduce" section is a
-hard regression list.
+`CONTEXT.md` (repo root, mirrored as `AGENTS.md`) is the intended design of the
+whole system. Read it before every task. When a change alters the architecture,
+update `CONTEXT.md` **in the same change** — the doc must never drift from the
+code. Its "Bugs already fixed — don't reintroduce" section is a hard regression
+list.
 
 ## CURRENT STATE (read this first)
 The reliability audit is **complete**. Nine fixes shipped and live on `main`
@@ -33,28 +34,28 @@ polluted by manual `post` test runs). During this window:
 
 ## Operating loop (when the user does ask for work)
 1. User gives a goal.
-2. You turn it into one scoped ticket (format below).
-3. You delegate that ticket to `codex-engineer` via MCP, passing the ticket plus
-   relevant `CONTEXT.md` context. **One ticket at a time.**
-4. Codex returns a diff / report. You review it against the checklist below.
-5. Fails → back to Codex with specific, numbered notes. Passes → summarize the
-   change for the user in plain language and **stop**.
+2. You scope it: which files, what changes, what must not break. State this
+   back before editing, in the ticket shape below. One change at a time.
+3. You make the edit directly in the repo.
+4. You review your own diff against the checklist below and report honestly —
+   including anything you're unsure about, not just the happy path.
+5. You summarize the change in plain language and **stop**. The user approves
+   before you commit.
 6. **Never commit, push, or trigger the live posting flow without the user's
    explicit approval in the current session.** The user is the merge gate.
 
-## Ticket format (what you hand Codex)
+## Change shape (state this before editing)
 ```
-TICKET: <title>
+CHANGE: <title>
 Why: <1-2 lines of intent>
 Files in scope: <paths>   |   Out of scope: <don't touch>
-Change: <precise behavior, not vague prose>
-Acceptance criteria: <testable>
+What changes: <precise behavior, not vague prose>
+How I'll verify: <command(s) + expected output>
 Must not break: <relevant don't-reintroduce items>
-Verify: <command(s) + expected output>
 ```
 
-## Review checklist (run on EVERY Codex diff)
-- Meets the acceptance criteria.
+## Review checklist (run on your OWN diff before reporting done)
+- Meets the stated intent.
 - Touches only in-scope files.
 - Clears the "don't reintroduce" list: mark ALL candidates seen *before*
   prefilter; source-balanced round-robin (no source-order slicing);
@@ -67,21 +68,17 @@ Verify: <command(s) + expected output>
   wire-photo republishing stays controllable via `photo_path`.
 - Posting-state integrity: feed success writes `posted=1`+`fb_post_id` BEFORE
   reel work; ambiguous feed failures set `review_needed=1` and are excluded
-  from selection; no reel retry unless explicitly ticketed.
+  from selection; no reel retry unless explicitly asked.
 - No secrets hardcoded — `ANTHROPIC_API_KEY`, `FB_PAGE_TOKEN`, `FB_PAGE_ID`
   from env only.
 - Verify migrations against the real `towch.db` (columns/tables added
-  idempotently; `PRAGMA integrity_check` == ok) — the user runs `db_init()`
-  directly, never a live mode, to test this.
+  idempotently; `PRAGMA integrity_check` == ok). Test by running `db_init()`
+  directly — never a live mode.
 
-## Guardrails for the Codex engineer
-- Run Codex sandboxed to **workspace-write with approvals ON**. Do **not** use
-  `--dangerously-bypass-approvals-and-sandbox` on this repo.
-- Codex may read/edit code in the working directory only. It must not commit,
-  push, read/print secrets, or trigger the Facebook posting flow.
-- This service auto-posts to a **live** Facebook Page. Any change to the posting
-  flow, scoring gates, or the `block` flag is high-risk: extra scrutiny and
-  explicit user sign-off before merge.
+## High-risk areas (extra scrutiny, always)
+This service auto-posts to a **live** Facebook Page. Any change to the posting
+flow, scoring gates, or the `block` flag gets extra review and explicit user
+sign-off before merge. When in doubt, do less and ask.
 
 ## Environment notes
 - Dev machine is Windows/PowerShell. Watch nested-quote issues in `python -c`

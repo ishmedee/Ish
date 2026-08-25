@@ -20,15 +20,10 @@ import json
 import os
 import re
 import sqlite3
-import socket
 import sys
 import time
 import hashlib
-import ipaddress
-import io
-import warnings
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urljoin, urlparse
 
 import feedparser
 import requests
@@ -171,20 +166,20 @@ MAX_ARTICLES_PER_RUN = 12        # cost & noise control
 MAX_PER_SOURCE = 6               # candidates per outlet per run (prefilter
                                  # is the cost gate, so a wide net is cheap)
 MIN_ARTICLE_CHARS = 400          # skip stubs/photo posts
-MAX_IMAGE_BYTES = 10 * 1024 * 1024
-MAX_IMAGE_REDIRECTS = 3
-MAX_IMAGE_PIXELS = 40_000_000
-MAX_FETCH_ATTEMPTS = 3           # bounded cross-run retries for fetch failures
-FETCH_RETRY_MAX_AGE_DAYS = 2     # never churn a dead URL beyond this age
-MODEL = "claude-sonnet-4-6" # cheap + good enough for summaries
+# Two-tier models: Opus 5 writes (best Mongolian quality where readers see
+# it); Sonnet 5 judges (cheap classification: prefilter, dedup, clustering).
+# Sonnet 5 is also CHEAPER than the old Sonnet 4.6 ($2/$10 vs $3/$15).
+MODEL_SMART = "claude-opus-5"    # summarize + synthesize (reader-facing text)
+MODEL_FAST  = "claude-sonnet-5"  # prefilter, dedup, cluster-confirm
+MODEL = MODEL_FAST               # legacy alias (safety for any missed ref)
 DB_PATH = "towch.db"
 OUTPUT_JSON = "digest.json"      # the website reads this file
 REQUEST_TIMEOUT = 15
 
 # ── Queue-system settings ─────────────────────────────────────
 MORNING_FRESH_HOUR = 9   # (legacy) kept for reference
-FIRST_COLLECTION_HOUR = 7  # first daily collection runs at 06:00 UB, so
-                            # posts before 07:00 use the prior day's news
+FIRST_COLLECTION_HOUR = 11  # first daily collection runs at 11:00 UB, so
+                            # posts before this must use the prior day's news
 MAX_QUEUE_AGE_DAYS = 5   # drop unposted stories older than this (covers
                          # a Friday story staying usable through Sunday)
 # (REEL_MIN_SCORE removed: at 6 posts/day every post gets a Reel.)
@@ -236,19 +231,12 @@ PROMPT = """Чи Монголын мэдээг энгийн ойлгомжтой
  "bullets": ["хамгийн чухал 3 баримтыг 3 товч өгүүлбэрээр", "...", "..."],
  "why": "энгийн иргэнд яагаад хамаатай болохыг 1 өгүүлбэрээр",
  "full_text": "Facebook пост дээр тавих ДЭЛГЭРЭНГҮЙ текст: 2-3 богино догол мөр (нийт 8-10 өгүүлбэр). Эхний догол мөрт юу болсныг гол баримтуудтай нь; хоёр дахьд ар дэвсгэр, нөхцөл байдал, оролцогч талуудын байр суурь/хариу үйлдэл; сүүлд нь энэ юунд хүргэх, дараа нь юу болох. Догол мөрүүдийг хоосон мөрөөр тусгаарла. Зөвхөн нийтлэлд байгаа баримтаар — нэмэлт таамаггүй.",
- "hashtags": ["энэ мэдээний гол сэдэв/хүн/байгууллага/газрыг илэрхийлсэн 3 монгол хаштаг", "...", "..."],
  "newsworthy": true/false,
  "importance": 0-100,
  "emotional": 0-100,
  "political": 0-100,
  "mongolia_related": true/false,
  "block": true/false}}
-
-"hashtags": ЯГ 3 ширхэг. Энэ мэдээнд гардаг тодорхой хүн, байгууллага, газар,
-  эсвэл гол сэдвийг нэрлэсэн монгол хаштаг (жишээ: УИХ, ОюуТолгой, татвар,
-  сонгууль, Улаанбаатар). Дүрэм: # тэмдэг БИЧИХГҮЙ; зай оруулахгүй (олон үгийг
-  залгаж эсвэл том үсгээр — "Улс төр" → "УлсТөр"); зөвхөн монгол/латин үсэг,
-  тоо; ерөнхий үг биш (#мэдээ, #Монгол гэхгүй — тэдгээр аль хэдийн нэмэгддэг).
 
 "newsworthy" дүгнэлт (ЧУХАЛ):
 false бол — дараах тохиолдолд:
@@ -298,11 +286,6 @@ def db_init():
         url TEXT PRIMARY KEY,
         first_seen TEXT
     )""")
-    con.execute("""CREATE TABLE IF NOT EXISTS fetch_attempts (
-        url TEXT PRIMARY KEY,
-        attempts INTEGER NOT NULL,
-        first_seen TEXT NOT NULL
-    )""")
     con.execute("""CREATE TABLE IF NOT EXISTS digests (
         url TEXT PRIMARY KEY,
         source TEXT, category TEXT, title TEXT,
@@ -321,11 +304,7 @@ def db_init():
                       ("posted_at", "TEXT"),                 # when it was posted
                       ("interest_score", "INTEGER DEFAULT 50"),  # engagement ranking
                       ("full_text", "TEXT"),                 # elaborated caption
-                      ("image_url", "TEXT"),                 # article og:image
-                      ("fb_post_id", "TEXT"),                # confirmed FB feed object id
-                      ("reel_posted", "INTEGER DEFAULT 0"),  # 1 only after Reel confirms
-                      ("review_needed", "INTEGER DEFAULT 0"),  # ambiguous feed outcome
-                      ("hashtags", "TEXT")]:                 # JSON array of article-specific hashtag tokens (no '#')
+                      ("image_url", "TEXT")]:                # article og:image
         if col not in cols:
             con.execute(f"ALTER TABLE digests ADD COLUMN {col} {decl}")
     con.commit()
@@ -341,79 +320,6 @@ def mark_seen(con, url):
         "INSERT OR IGNORE INTO seen VALUES (?, ?)",
         (url, datetime.now(UB_TZ).isoformat()),
     )
-    con.commit()
-
-
-def record_fetch_failure(con, url, now):
-    """Record a survivor fetch failure and decide whether it may retry."""
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=UB_TZ)
-
-    row = con.execute(
-        "SELECT attempts, first_seen FROM fetch_attempts WHERE url=?",
-        (url,),
-    ).fetchone()
-    if row is None:
-        attempts = 1
-        first_seen_raw = now.isoformat()
-        con.execute(
-            "INSERT INTO fetch_attempts (url, attempts, first_seen) "
-            "VALUES (?, ?, ?)",
-            (url, attempts, first_seen_raw),
-        )
-    else:
-        attempts = row[0] + 1
-        first_seen_raw = row[1]
-        # Deliberately update only attempts: the retry age must never reset.
-        con.execute(
-            "UPDATE fetch_attempts SET attempts=? WHERE url=?",
-            (attempts, url),
-        )
-
-    try:
-        first_seen = datetime.fromisoformat(first_seen_raw)
-        if first_seen.tzinfo is None:
-            first_seen = first_seen.replace(tzinfo=UB_TZ)
-        age = now - first_seen
-        age_days = max(0.0, age.total_seconds() / 86400)
-        age_expired = age > timedelta(days=FETCH_RETRY_MAX_AGE_DAYS)
-    except (TypeError, ValueError):
-        # Corrupt retry state must fail closed instead of churning forever.
-        age_days = float("nan")
-        age_expired = True
-
-    if attempts >= MAX_FETCH_ATTEMPTS or age_expired:
-        con.execute(
-            "INSERT OR IGNORE INTO seen (url, first_seen) VALUES (?, ?)",
-            (url, now.isoformat()),
-        )
-        con.execute("DELETE FROM fetch_attempts WHERE url=?", (url,))
-        con.commit()
-        age_text = "unknown" if age_days != age_days else f"{age_days:.1f} days"
-        print(
-            f"[fetch-retry] GIVING UP {url} after {attempts} attempts / "
-            f"age {age_text}"
-        )
-        return "giveup"
-
-    # Only a failed prefilter survivor reaches this deletion. Rejected titles
-    # never enter this helper and remain permanently marked seen.
-    con.execute("DELETE FROM seen WHERE url=?", (url,))
-    con.commit()
-    print(
-        f"[fetch-retry] transient fetch fail, will retry "
-        f"(attempt {attempts}/{MAX_FETCH_ATTEMPTS}): {url}"
-    )
-    return "retry"
-
-
-def clear_fetch_retry(con, url):
-    """Clear retry state after a survivor fetch succeeds."""
-    con.execute(
-        "INSERT OR IGNORE INTO seen (url, first_seen) VALUES (?, ?)",
-        (url, datetime.now(UB_TZ).isoformat()),
-    )
-    con.execute("DELETE FROM fetch_attempts WHERE url=?", (url,))
     con.commit()
 
 
@@ -559,8 +465,8 @@ def collect_from_listing(src, con):
 
 
 def collect_candidates(con):
-    """Pull all sources and return up to 40 source-balanced candidates."""
-    source_batches = []
+    """Pull all sources, return list of new (source, title, url) tuples."""
+    candidates = []
     for src in SOURCES:
         try:
             if src.get("rss"):
@@ -569,29 +475,14 @@ def collect_candidates(con):
                 fresh = collect_from_listing(src, con)
             else:
                 continue
-            source_batches.append(fresh)
+            candidates.extend(fresh)
             print(f"[collect] {src['name']}: {len(fresh)} new")
         except Exception as e:
             print(f"[collect] {src['name']} FAILED: {e}")
-
-    # Keep the prefilter input budget at 40 without favoring sources that
-    # appear early in SOURCES. Take one candidate from each source per
-    # round until the cap is reached or every source batch is exhausted.
-    candidates = []
-    round_index = 0
-    while len(candidates) < 40:
-        added = False
-        for batch in source_batches:
-            if round_index >= len(batch):
-                continue
-            candidates.append(batch[round_index])
-            added = True
-            if len(candidates) >= 40:
-                break
-        if not added:
-            break
-        round_index += 1
-    return candidates
+    # No early truncation: the title prefilter is the cost gate now (one
+    # cheap batch call judges all titles). The old [:12] cap cut in source
+    # order, silently discarding tovch/eguur political stories every run.
+    return candidates[:40]  # generous safety ceiling only
 
 
 def fetch_article_text(url, selector, use_proxy=False):
@@ -658,7 +549,7 @@ def _parse_json_lenient(raw):
 
 def summarize(client, source_name, text):
     msg = client.messages.create(
-        model=MODEL,
+        model=MODEL_SMART,
         max_tokens=2200,   # headroom for the 2-3 paragraph full_text
                            # (truncation kills the whole story's JSON)
         messages=[{
@@ -720,7 +611,7 @@ def cluster_candidates(client, articles):
                             for i, a in enumerate(g))
         try:
             msg = client.messages.create(
-                model=MODEL,
+                model=MODEL_FAST,
                 max_tokens=200,
                 messages=[{"role": "user", "content":
                     "Доорх гарчгууд ИЖИЛ үйл явдлыг мэдээлж байна уу? "
@@ -748,18 +639,12 @@ SYNTH_PROMPT = """Чи Монголын мэдээг энгийн ойлгомж
  "bullets": ["бүх эх сурвалжийн чухал баримтыг нэгтгэсэн 3 өгүүлбэр", "...", "..."],
  "why": "энгийн иргэнд яагаад хамаатайг 1 өгүүлбэрээр",
  "full_text": "Facebook пост дээр тавих ДЭЛГЭРЭНГҮЙ текст: бүх эх сурвалжийг нэгтгэн 2-3 богино догол мөр (нийт 8-10 өгүүлбэр) — юу болсон, ар дэвсгэр нөхцөл, талуудын байр суурь, үр дагавар/дараагийн алхам. Догол мөрүүдийг хоосон мөрөөр тусгаарла. Зөвхөн нийтлэлүүдэд байгаа баримтаар — таамаггүй.",
- "hashtags": ["энэ мэдээний гол сэдэв/хүн/байгууллага/газрыг илэрхийлсэн 3 монгол хаштаг", "...", "..."],
  "newsworthy": true/false,
  "importance": 0-100,
  "emotional": 0-100,
  "political": 0-100,
  "mongolia_related": true/false,
  "block": true/false}}
-
-"hashtags": ЯГ 3 ширхэг. Мэдээнд гардаг тодорхой хүн, байгууллага, газар, эсвэл
-  гол сэдвийг нэрлэсэн монгол хаштаг. Дүрэм: # тэмдэг БИЧИХГҮЙ; зай оруулахгүй
-  (олон үгийг залгаж эсвэл том үсгээр); зөвхөн монгол/латин үсэг, тоо; ерөнхий
-  үг биш (#мэдээ, #Монгол гэхгүй — тэдгээр аль хэдийн нэмэгддэг).
 
 "political" (0-100): Монголын улс төрд хэр холбоотой вэ? УИХ, Засгийн газар,
   Ерөнхийлөгч, сайд, намууд, сонгууль, хууль/бодлого, авлига, томилгоо,
@@ -785,7 +670,7 @@ def synthesize_cluster(client, cluster):
     for a in cluster:
         blocks.append(f"--- Эх сурвалж: {a['src']} ---\n{a['text'][:4000]}")
     msg = client.messages.create(
-        model=MODEL,
+        model=MODEL_SMART,
         max_tokens=2200,   # headroom for the 2-3 paragraph full_text
         messages=[{"role": "user", "content": SYNTH_PROMPT.format(
             cats="/".join(CATEGORIES),
@@ -803,89 +688,6 @@ def synthesize_cluster(client, cluster):
 FB_API = "https://graph.facebook.com/v23.0"
 # How many top stories to post per edition (don't flood the feed)
 FB_MAX_POSTS = 3
-
-
-# ── Hashtags ──────────────────────────────────────────────────
-# Every caption (feed post AND reel, since both call build_caption) ends
-# with 6 hashtags: 3 FIXED brand/site tags + up to 3 ARTICLE-specific tags.
-# The article tags are generated by the summarizer, sanitized at collect
-# time, and stored in the `hashtags` column. This is a reach lever: FB
-# hashtags are a minor signal, but free to add.
-#
-# FIXED_HASHTAGS is editorial — change these three words freely.
-FIXED_HASHTAGS = ["#ИшТойм", "#Монгол", "#мэдээ"]
-
-# Fallback article tags by category, used only when the AI returns fewer
-# than 3 usable tags (or for old queued items with no stored hashtags).
-# Keep these DISTINCT from FIXED_HASHTAGS (no "Монгол"/"мэдээ") so dedup
-# never shrinks the line below 6.
-CATEGORY_HASHTAGS = {
-    "Улс төр":     ["улстөр", "улсТөр", "Монголынулстөр"],
-    "Эдийн засаг": ["эдийнзасаг", "эдийнЗасаг", "эдийнзасагМэдээ"],
-    "Нийгэм":      ["нийгэм", "нийгмийнмэдээ", "нийгэмМонгол"],
-    "Технологи":   ["технологи", "технологиМэдээ", "шинжлэхухаан"],
-    "Спорт":       ["спорт", "монголспорт", "тамирчид"],
-    "Дэлхий":      ["дэлхий", "олонулс", "дэлхийнмэдээ"],
-}
-
-
-def _sanitize_hashtag(raw):
-    """One raw AI tag → a clean bare token (no '#'), or None if unusable.
-    Strips '#', removes spaces/punctuation (joining multi-word tags), keeps
-    only word characters (Cyrillic/Latin letters, digits, underscore)."""
-    if not isinstance(raw, str):
-        return None
-    tok = re.sub(r"[^\w]", "", raw.strip().lstrip("#"), flags=re.UNICODE)
-    # FB ignores all-numeric / leading-digit tags; drop too-short/long.
-    if not tok or tok[0].isdigit() or len(tok) < 2 or len(tok) > 40:
-        return None
-    return tok
-
-
-def _clean_hashtags(raw_list, category):
-    """AI's raw hashtag list → up to 3 unique bare tokens, padded from the
-    category fallback if the AI returned fewer than 3 usable tags. Tokens
-    colliding with FIXED_HASHTAGS are skipped so the composed line always
-    reaches 6 distinct tags."""
-    out = []
-    seen = {t.lower().lstrip("#") for t in FIXED_HASHTAGS}
-
-    def _add(tok):
-        low = tok.lower()
-        if low in seen:
-            return
-        seen.add(low)
-        out.append(tok)
-
-    for raw in (raw_list or []):
-        tok = _sanitize_hashtag(raw)
-        if tok:
-            _add(tok)
-        if len(out) >= 3:
-            return out[:3]
-    for tok in CATEGORY_HASHTAGS.get(category, []):
-        if len(out) >= 3:
-            break
-        _add(tok)
-    return out[:3]
-
-
-def _compose_hashtag_line(item):
-    """FIXED_HASHTAGS + up to 3 article tags, deduped, capped at 6.
-    Article tags come from the stored `hashtags` list; if absent (old
-    items), fall back to the category tags."""
-    tags = list(FIXED_HASHTAGS)
-    seen = {t.lower().lstrip("#") for t in tags}
-    article = item.get("hashtags") or CATEGORY_HASHTAGS.get(item.get("category", ""), [])
-    for t in article:
-        tok = str(t).strip().lstrip("#")
-        if not tok or tok.lower() in seen:
-            continue
-        seen.add(tok.lower())
-        tags.append("#" + tok)
-        if len(tags) >= 6:
-            break
-    return " ".join(tags)
 
 
 def build_caption(item):
@@ -917,49 +719,30 @@ def build_caption(item):
     lines.append(f"📰 Эх сурвалж: {srcs}")
     lines.append(f"🔗 {item['url']}")
     lines.append("")
-    lines.append(_compose_hashtag_line(item))
+    lines.append("#Иш #мэдээ #улстөр")
     return "\n".join(lines)
 
 
 def post_one_to_facebook(item, card_path, token, page_id):
-    """
-    Post ONE story's card as a feed post.
-
-    Returns {"status": "success|clean_failure|ambiguous_failure",
-             "fb_post_id": str|None}.
-    Only the public /feed request can be ambiguous; an unpublished-photo
-    upload failure is clean because no feed post was attempted.
-    """
+    """Post ONE story's card as a feed post. Returns True on success."""
     if not card_path or not os.path.exists(card_path):
         print(f"[fb] no card file for: {item['title'][:40]}")
-        return {"status": "clean_failure", "fb_post_id": None}
+        return False
     caption = build_caption(item)
-
-    # Step 1: upload photo unpublished. Failure here cannot create a public
-    # feed post, so it is always safe for the queue to retry naturally.
     try:
+        # Step 1: upload photo unpublished
         with open(card_path, "rb") as img:
             up = requests.post(
                 f"{FB_API}/{page_id}/photos",
                 data={"published": "false", "access_token": token},
                 files={"source": img}, timeout=60,
             )
-        try:
-            up_body = up.json()
-        except ValueError:
-            up_body = {}
-        photo_id = up_body.get("id")
+        photo_id = up.json().get("id")
         if not photo_id:
-            err = up_body.get("error", {}).get("message", up.text[:200])
+            err = up.json().get("error", {}).get("message", up.text[:200])
             print(f"[fb] upload FAILED ({up.status_code}): {err}")
-            return {"status": "clean_failure", "fb_post_id": None}
-    except Exception as e:
-        print(f"[fb] unpublished photo upload FAILED: {e}")
-        return {"status": "clean_failure", "fb_post_id": None}
-
-    # Step 2: create the public feed post. A timeout or lost connection after
-    # sending is ambiguous: Facebook may have accepted it despite no response.
-    try:
+            return False
+        # Step 2: create feed post with photo attached
         r = requests.post(
             f"{FB_API}/{page_id}/feed",
             data={"message": caption,
@@ -967,46 +750,15 @@ def post_one_to_facebook(item, card_path, token, page_id):
                   "access_token": token},
             timeout=60,
         )
-    except requests.exceptions.Timeout as e:
-        print(f"[fb] AMBIGUOUS feed timeout — REVIEW REQUIRED: {e}")
-        return {"status": "ambiguous_failure", "fb_post_id": None}
-    except requests.exceptions.ConnectionError as e:
-        message = str(e).lower()
-        clean_markers = (
-            "connection refused",
-            "failed to establish a new connection",
-            "getaddrinfo failed",
-            "name or service not known",
-            "network is unreachable",
-        )
-        if any(marker in message for marker in clean_markers):
-            print(f"[fb] feed connection rejected before response: {e}")
-            return {"status": "clean_failure", "fb_post_id": None}
-        print(f"[fb] AMBIGUOUS feed connection loss — REVIEW REQUIRED: {e}")
-        return {"status": "ambiguous_failure", "fb_post_id": None}
-    except requests.exceptions.RequestException as e:
-        print(f"[fb] AMBIGUOUS feed request failure — REVIEW REQUIRED: {e}")
-        return {"status": "ambiguous_failure", "fb_post_id": None}
+        if r.status_code == 200 and r.json().get("id"):
+            print(f"[fb] posted to feed: {item['title'][:50]}")
+            return True
+        err = r.json().get("error", {}).get("message", r.text[:200])
+        print(f"[fb] feed post FAILED ({r.status_code}): {err}")
+        return False
     except Exception as e:
-        print(f"[fb] AMBIGUOUS feed failure — REVIEW REQUIRED: {e}")
-        return {"status": "ambiguous_failure", "fb_post_id": None}
-
-    try:
-        body = r.json()
-    except ValueError:
-        body = {}
-    if 200 <= r.status_code < 300:
-        post_id = body.get("id")
-        if post_id:
-            print(f"[fb] posted to feed: {item['title'][:50]} ({post_id})")
-            return {"status": "success", "fb_post_id": post_id}
-        print("[fb] AMBIGUOUS successful response without post id — "
-              "REVIEW REQUIRED")
-        return {"status": "ambiguous_failure", "fb_post_id": None}
-
-    err = body.get("error", {}).get("message", r.text[:200])
-    print(f"[fb] feed post REJECTED ({r.status_code}): {err}")
-    return {"status": "clean_failure", "fb_post_id": None}
+        print(f"[fb] error posting {item['title'][:40]}: {e}")
+        return False
 
 
 def post_reel_to_facebook(item, reel_path, token, page_id):
@@ -1172,28 +924,25 @@ def is_duplicate_of_recent(client, con, new_title, new_bullets, days=3):
          call entirely (this is the common case, so most stories cost $0).
       2. Only when there ARE similar-looking candidates do we ask Claude,
          and we send just the top few (not all 40) to keep the prompt short.
-         The check sends bullets alongside titles: rewritten titles about
-         the same event emphasise different numbers/places, so titles alone
-         systematically miss rewordings.
     Returns True if it's a duplicate (should skip).
     """
     cutoff = (datetime.now(UB_TZ).date() - timedelta(days=days)).isoformat()
     rows = con.execute(
-        "SELECT title, bullets FROM digests "
+        "SELECT title FROM digests "
         "WHERE collected_date >= ? OR posted=1 "
-        "ORDER BY run_at DESC LIMIT 40", (cutoff,)
+        "ORDER BY run_at DESC LIMIT 80", (cutoff,)
     ).fetchall()
-    recent = [(r[0], r[1]) for r in rows if r[0]]
+    recent = [r[0] for r in rows if r[0]]
     if not recent:
         return False
 
     # exact match — free, instant
-    if new_title in (t for t, _b in recent):
+    if new_title in recent:
         return True
 
     # Stage 1: free similarity scoring
     scored = sorted(
-        ((_title_similarity(new_title, t), t, b) for t, b in recent),
+        ((_title_similarity(new_title, t), t) for t in recent),
         key=lambda x: x[0], reverse=True,
     )
     best_sim = scored[0][0] if scored else 0.0
@@ -1203,47 +952,27 @@ def is_duplicate_of_recent(client, con, new_title, new_bullets, days=3):
     if best_sim >= 0.6:
         return True
     # Very low overlap => clearly different topic; skip the AI call.
-    # Floor is 0.12: AI-retitling plus Mongolian suffix morphology push
-    # genuine same-event rewordings down to ~0.15 Jaccard (observed), so
-    # a higher floor lets duplicates exit free without the AI check.
+    # (0.12, tightened from 0.18: differently-worded same-events were
+    #  slipping under the old threshold and double-posting.)
     if best_sim < 0.12:
         return False
 
     # Stage 2: ambiguous middle ground — ask Claude, but only about the
-    # top candidates (short prompt), not all 40 titles. Bullets go along
-    # too: they carry the concrete numbers/places that rewritten titles
-    # omit, which is what lets Claude recognise a reworded same event.
-    def _facts(bullets_json):
-        try:
-            parts = json.loads(bullets_json or "[]")
-            return "; ".join(str(p) for p in parts)[:300]
-        except Exception:
-            return ""
-
-    candidates = [(t, b) for sim, t, b in scored[:6] if sim >= 0.12]
+    # top candidates (short prompt), not all 40 titles.
+    candidates = [t for sim, t in scored[:8] if sim >= 0.12]
     if not candidates:
         return False
-    lines = []
-    for i, (t, b) in enumerate(candidates):
-        facts = _facts(b)
-        lines.append(f"{i+1}. {t}"
-                     + (f"\n   Баримт: {facts}" if facts else ""))
-    numbered = "\n".join(lines)
-    new_facts = "; ".join(str(p) for p in (new_bullets or []))[:300]
+    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(candidates))
     prompt = (
-        "Доорх ШИНЭ мэдээ нь ӨМНӨХ мэдээнүүдийн аль нэгтэй ИЖИЛ үйл явдлыг "
-        "дахин мэдээлж байна уу? Өөр найруулгатай, өөр тоо/газар онцолсон, "
-        "эсвэл нэг хэрэг явдлын шинэчилсэн тоо баримт мэдээлсэн ч ИЖИЛ үйл "
-        "явдалд тооцно. Харин цоо шинэ хөгжил, дараагийн тусдаа үйл явдал "
-        "бол ижил биш.\n\n"
-        f"ШИНЭ мэдээ: {new_title}\n"
-        + (f"Баримт: {new_facts}\n" if new_facts else "")
-        + f"\nӨМНӨХ мэдээнүүд:\n{numbered}\n\n"
+        "Доорх 'ШИНЭ мэдээ' нь 'ӨМНӨХ мэдээнүүд'-ийн аль нэгтэй ЯГ ИЖИЛ үйл "
+        "явдлыг өгүүлж байна уу? (өөр өнцөг биш, ижил үйл явдал)\n\n"
+        f"ШИНЭ мэдээ: {new_title}\n\n"
+        f"ӨМНӨХ мэдээнүүд:\n{numbered}\n\n"
         "ЗӨВХӨН JSON: {\"duplicate\": true/false}"
     )
     try:
         msg = client.messages.create(
-            model=MODEL,
+            model=MODEL_FAST,
             max_tokens=30,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -1267,51 +996,20 @@ def prefilter_political_titles(client, candidates):
     """
     if not candidates:
         return []
-
-    def fallback(reason):
-        """Return a deterministic source-balanced subset capped at eight."""
-        batches_by_source = {}
-        for candidate in candidates:
-            src = candidate[0]
-            source_key = (
-                str(src.get("name", "")),
-                str(src.get("rss") or src.get("listing") or ""),
-            )
-            batches_by_source.setdefault(source_key, []).append(candidate)
-
-        batches = list(batches_by_source.values())
-        kept = []
-        round_index = 0
-        while len(kept) < 8:
-            added = False
-            for batch in batches:
-                if round_index >= len(batch):
-                    continue
-                kept.append((*batch[round_index], None))
-                added = True
-                if len(kept) >= 8:
-                    break
-            if not added:
-                break
-            round_index += 1
-
-        print(f"[prefilter] FALLBACK — {reason}; kept {len(kept)} of "
-              f"{len(candidates)} source-balanced candidates (cap 8)")
-        return kept
-
     titles = [t for (_s, t, _u) in candidates]
     numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(titles))
     prompt = (
         "Чи Монголын мэдээний редактор. Доорх гарчиг бүрд 'ХАЛУУН МЭДЭЭ' "
         "оноо (0-100) өг: уншигчид хэр их анхаарал хандуулж, хуваалцаж, "
         "сэтгэгдэл бичих вэ?\n\n"
-        "ӨНДӨР (70-100): улс төрийн дуулиан, авлига, огцруулалт/томилгоо, "
-        "жагсаал эсэргүүцэл, гэмт хэрэг, осол гамшиг, иргэдийн мөнгөнд шууд "
-        "нөлөөлөх шийдвэр (татвар, тэтгэвэр, цалин, үнэ тариф), хурц зөрчил "
-        "маргаан, гэнэтийн том үйл явдал.\n"
-        "ДУНД (40-65): УИХ/Засгийн газрын бодит ажил хэрэг, хууль тогтоомж, "
-        "эдийн засаг банк санхүү, нийгмийн тулгамдсан асуудал (орон сууц, "
-        "эрүүл мэнд, боловсрол, амьжиргаа), сонирхолтой хүний түүх.\n"
+        "ӨНДӨР (70-100): МОНГОЛЫН УЛС ТӨР — УИХ, Засгийн газар, Ерөнхийлөгч, "
+        "сайд, намуудын шийдвэр үйл ажиллагаа; улс төрийн дуулиан, авлига, "
+        "огцруулалт/томилгоо, сонгууль, хууль бодлого, жагсаал эсэргүүцэл; "
+        "мөн иргэдийн мөнгөнд шууд нөлөөлөх төрийн шийдвэр (татвар, тэтгэвэр, "
+        "цалин, тариф).\n"
+        "ДУНД (40-65): Монголын эдийн засаг банк санхүү; улс төртэй "
+        "холбоогүй ч том нийгмийн үйл явдал (ноцтой гэмт хэрэг, осол, "
+        "тулгамдсан асуудал — орон сууц, эрүүл мэнд, боловсрол).\n"
         "БАГА (0-25): ёслол хүндэтгэл, шагнал гардуулалт, форум чуулган "
         "нээлт, байгууллагын PR, ердийн урьдчилсан мэдээ, спортын хуваарь, "
         "зар сурталчилгаа.\n\n"
@@ -1321,20 +1019,18 @@ def prefilter_political_titles(client, candidates):
     )
     try:
         msg = client.messages.create(
-            model=MODEL,
+            model=MODEL_FAST,
             max_tokens=400,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = "".join(b.text for b in msg.content if b.type == "text")
         scores = _parse_json_lenient(raw)
         if not isinstance(scores, list) or len(scores) != len(candidates):
-            received = len(scores) if isinstance(scores, list) else "non-list"
-            return fallback(
-                f"wrong score count/type (expected {len(candidates)}, "
-                f"received {received})"
-            )
+            print("[prefilter] unexpected response, keeping all")
+            return [(s, t, u, None) for (s, t, u) in candidates]
     except Exception as e:
-        return fallback(f"Claude/JSON failure: {type(e).__name__}: {e}")
+        print(f"[prefilter] failed, keeping all: {e}")
+        return [(s, t, u, None) for (s, t, u) in candidates]
 
     scored = []
     for (src, title, url), sc in zip(candidates, scores):
@@ -1403,18 +1099,14 @@ def run_collector():
         try:
             text, image_url = fetch_article_text(url, src["article_selector"],
                                                  use_proxy=src.get("use_proxy", False))
+            if len(text) < MIN_ARTICLE_CHARS:
+                print(f"[skip] too short: {title[:50]}")
+                continue
+            articles.append({"src": src["name"], "title": title,
+                             "url": url, "text": text,
+                             "image_url": image_url})
         except Exception as e:
             print(f"[fail] {url}: {e}")
-            record_fetch_failure(con, url, now)
-            continue
-        if not text or len(text) < MIN_ARTICLE_CHARS:
-            print(f"[skip] too short: {title[:50]}")
-            record_fetch_failure(con, url, now)
-            continue
-        clear_fetch_retry(con, url)
-        articles.append({"src": src["name"], "title": title,
-                         "url": url, "text": text,
-                         "image_url": image_url})
 
     if not articles:
         print("[collector] nothing usable after fetch/filter")
@@ -1483,7 +1175,10 @@ def run_collector():
             emo = max(0, min(100, int(d.get("emotional", 50))))
             multi_boost = min(6, (len(sources) - 1) * 3)
             econ_boost = 8 if d.get("category") == "Эдийн засаг" else 0
-            interest = min(100, round(0.48 * emo + 0.32 * pol + 0.20 * imp)
+            # POLITICS-LED blend (reverted from attention-led): political
+            # weight dominates, viral pull second, impact third — the page
+            # is first and foremost a Mongolian politics outlet.
+            interest = min(100, round(0.50 * pol + 0.30 * emo + 0.20 * imp)
                            + multi_boost + econ_boost)
 
             # No card render here: the poster regenerates the card on its
@@ -1492,28 +1187,24 @@ def run_collector():
             # wasted work with a permanently stale path.
             card_path = None
 
-            # article-specific hashtags: sanitize the AI's list now (at
-            # collect time, where the category is known for fallback padding)
-            # and store bare tokens; the poster prepends the fixed tags.
-            article_tags = _clean_hashtags(d.get("hashtags"),
-                                           d.get("category", "Нийгэм"))
-
             # queue it: posted=0, tagged with today's date
             con.execute(
-                "INSERT OR REPLACE INTO digests "
+                # OR IGNORE (not REPLACE): if this URL already has a row,
+                # leave it untouched — REPLACE would reset posted=0 and
+                # cause a re-post if the URL ever slipped past `seen`.
+                "INSERT OR IGNORE INTO digests "
                 "(url, source, category, title, bullets, why, orig_min, "
                 "published, run_at, sources, source_count, all_urls, "
                 "posted, collected_date, card_path, interest_score, full_text, "
-                "image_url, hashtags) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "image_url) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (primary["url"], primary["src"], d.get("category", "Нийгэм"),
                  d["title"], json.dumps(d["bullets"], ensure_ascii=False),
                  d["why"], orig_min, now.isoformat(), now.isoformat(),
                  json.dumps(sources, ensure_ascii=False), len(sources),
                  json.dumps(all_urls, ensure_ascii=False),
                  0, today, card_path, interest, d.get("full_text", ""),
-                 primary.get("image_url"),
-                 json.dumps(article_tags, ensure_ascii=False)),
+                 primary.get("image_url")),
             )
             con.commit()
             queued += 1
@@ -1558,9 +1249,9 @@ def pick_story_to_post(con, now):
         return con.execute(
             "SELECT url, source, category, title, bullets, why, sources, "
             "source_count, card_path, collected_date, full_text, interest_score, "
-            "image_url, hashtags "
+            "image_url "
             "FROM digests "
-            "WHERE posted=0 AND COALESCE(review_needed, 0)=0 AND " + where +
+            "WHERE posted=0 AND " + where +
             # Primary: highest interest score (politics dominates).
             # Tie/filler preference: among similar scores, economy stories
             # (Эдийн засаг) come first — so when strong politics runs out,
@@ -1591,34 +1282,8 @@ def pick_story_to_post(con, now):
         return None, mode
     keys = ["url", "source", "category", "title", "bullets", "why",
             "sources", "source_count", "card_path", "collected_date",
-            "full_text", "interest_score", "image_url", "hashtags"]
+            "full_text", "interest_score", "image_url"]
     return dict(zip(keys, row)), mode
-
-
-def is_safe_public_url(url):
-    """Return True only for HTTP(S) URLs resolving entirely to public IPs."""
-    try:
-        parsed = urlparse(url)
-        if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
-            return False
-        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
-        addresses = socket.getaddrinfo(
-            parsed.hostname, port, type=socket.SOCK_STREAM
-        )
-        if not addresses:
-            return False
-        for address in addresses:
-            raw_ip = address[4][0].split("%", 1)[0]
-            if not ipaddress.ip_address(raw_ip).is_global:
-                return False
-        return True
-    except (OSError, TypeError, ValueError):
-        return False
-
-
-def _reject_article_image(url, reason):
-    print(f"[poster] ARTICLE IMAGE REJECTED {url}: {reason}")
-    return None
 
 
 def download_article_image(image_url, article_url, out_dir="imgs"):
@@ -1627,129 +1292,91 @@ def download_article_image(image_url, article_url, out_dir="imgs"):
     Validates it's a real, reasonably-sized image (rejects tiny logos,
     favicons, broken files). Returns a local path or None.
     """
-    del article_url  # kept in the public signature for existing callers
-    current_url = image_url
-    response = None
     try:
-        redirects = 0
-        while True:
-            # This validates the initial URL and, on the final iteration, the
-            # exact post-redirect URL immediately before it is fetched.
-            if not is_safe_public_url(current_url):
-                return _reject_article_image(
-                    current_url, "unsafe, non-public, or unresolvable URL"
-                )
-            response = requests.get(
-                current_url,
-                headers=HEADERS,
-                timeout=25,
-                allow_redirects=False,
-                stream=True,
-            )
-            if response.status_code in (301, 302, 303, 307, 308):
-                location = response.headers.get("Location")
-                if not location:
-                    return _reject_article_image(
-                        current_url, "redirect response has no Location"
-                    )
-                if redirects >= MAX_IMAGE_REDIRECTS:
-                    return _reject_article_image(
-                        current_url,
-                        f"more than {MAX_IMAGE_REDIRECTS} redirects",
-                    )
-                next_url = urljoin(current_url, location)
-                # Validate before following the hop; requests never sees an
-                # unsafe redirect target.
-                if not is_safe_public_url(next_url):
-                    return _reject_article_image(
-                        next_url, "redirect targets a non-public URL"
-                    )
-                response.close()
-                response = None
-                current_url = next_url
-                redirects += 1
-                continue
-            break
-
-        if response.status_code != 200:
-            return _reject_article_image(
-                current_url, f"HTTP status {response.status_code}"
-            )
-
-        content_type = response.headers.get("Content-Type", "")
-        content_type = content_type.split(";", 1)[0].strip().lower()
-        if not content_type.startswith("image/"):
-            return _reject_article_image(
-                current_url, f"non-image Content-Type {content_type or 'missing'}"
-            )
-
-        content_length = response.headers.get("Content-Length")
-        if content_length:
-            try:
-                if int(content_length) > MAX_IMAGE_BYTES:
-                    return _reject_article_image(
-                        current_url,
-                        f"Content-Length exceeds {MAX_IMAGE_BYTES} bytes",
-                    )
-            except ValueError:
-                pass
-
-        body = io.BytesIO()
-        byte_count = 0
-        for chunk in response.iter_content(chunk_size=64 * 1024):
-            if not chunk:
-                continue
-            byte_count += len(chunk)
-            if byte_count > MAX_IMAGE_BYTES:
-                return _reject_article_image(
-                    current_url,
-                    f"stream exceeded {MAX_IMAGE_BYTES} bytes",
-                )
-            body.write(chunk)
-        if byte_count < 8000:
-            return _reject_article_image(
-                current_url, f"image is only {byte_count} bytes (minimum 8000)"
-            )
-
-        from PIL import Image as _Img
-        _Img.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
-        body.seek(0)
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", _Img.DecompressionBombWarning)
-                with _Img.open(body) as im:
-                    width, height = im.size
-                    if width * height > MAX_IMAGE_PIXELS:
-                        return _reject_article_image(
-                            current_url,
-                            f"{width}x{height} exceeds {MAX_IMAGE_PIXELS} pixels",
-                        )
-                    if width < 400 or height < 250:
-                        return _reject_article_image(
-                            current_url,
-                            f"{width}x{height} is below minimum 400x250",
-                        )
-                    im.verify()
-        except (_Img.DecompressionBombError,
-                _Img.DecompressionBombWarning) as e:
-            return _reject_article_image(
-                current_url, f"decompression bomb rejected: {e}"
-            )
-
+        # find the source config to honor its proxy flag
+        use_proxy = False
+        for s in SOURCES:
+            base = s.get("base_url", "")
+            if base and article_url.startswith(base):
+                use_proxy = s.get("use_proxy", False)
+                break
+        r = fetch_html(image_url, timeout=25, use_proxy=use_proxy)
+        if r.status_code != 200 or len(r.content) < 8000:
+            return None
         os.makedirs(out_dir, exist_ok=True)
         h = hashlib.md5(image_url.encode()).hexdigest()[:10]
         path = os.path.join(out_dir, f"img_{h}.jpg")
         with open(path, "wb") as f:
-            f.write(body.getvalue())
+            f.write(r.content)
+        # validate with Pillow: openable and big enough to be a news photo
+        from PIL import Image as _Img
+        with _Img.open(path) as im:
+            im.verify()
+        with _Img.open(path) as im:
+            if im.width < 400 or im.height < 250:
+                return None
         return path
     except Exception as e:
-        return _reject_article_image(image_url, f"download error: {e}")
-    finally:
-        if response is not None:
-            try:
-                response.close()
-            except Exception:
-                pass
+        print(f"[poster] article image skipped ({e})")
+        return None
+
+
+POSTED_LOG = "posted_log.txt"   # append-only url<TAB>title<TAB>date; a text
+                                # backstop for posted-state that survives the
+                                # binary-DB merge losses better than towch.db
+
+
+def log_posted(url, title):
+    """Append a successful post to the durable text log."""
+    try:
+        with open(POSTED_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{url}\t{title}\t{datetime.now(UB_TZ).date().isoformat()}\n")
+    except Exception as e:
+        print(f"[poster] posted-log append failed: {e}")
+
+
+def load_posted_log(days=7):
+    """Return (set_of_urls, list_of_titles) posted within the last N days."""
+    urls, titles = set(), []
+    cutoff = (datetime.now(UB_TZ).date() - timedelta(days=days)).isoformat()
+    try:
+        with open(POSTED_LOG, encoding="utf-8") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 3 and parts[2] >= cutoff:
+                    urls.add(parts[0])
+                    titles.append(parts[1])
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[poster] posted-log read failed: {e}")
+    return urls, titles
+
+
+def sync_posted_flags_from_log(con):
+    """
+    Re-apply posted=1 for any URL in the log whose DB row lost its flag
+    (binary towch.db merges can erase one run's changes; the text log is
+    the durable record).
+    """
+    urls, _ = load_posted_log(days=14)
+    if not urls:
+        return
+    fixed = 0
+    for u in urls:
+        cur = con.execute(
+            "UPDATE digests SET posted=1 WHERE url=? AND posted=0", (u,))
+        fixed += cur.rowcount
+    if fixed:
+        con.commit()
+        print(f"[poster] restored posted=1 on {fixed} row(s) from posted_log")
+
+
+def looks_already_posted(title, posted_titles, threshold=0.5):
+    """True if `title` closely matches something we already posted."""
+    if title in posted_titles:
+        return True
+    return any(_title_similarity(title, t) >= threshold for t in posted_titles)
 
 
 def run_poster():
@@ -1763,7 +1390,23 @@ def run_poster():
         print("[poster] no FB credentials — abort")
         return
 
-    story, mode = pick_story_to_post(con, now)
+    # Restore any posted=1 flags the binary-DB merge may have erased,
+    # then pick — skipping anything whose title matches a recent post.
+    sync_posted_flags_from_log(con)
+    _, posted_titles = load_posted_log(days=7)
+
+    story, mode = None, None
+    for _attempt in range(6):
+        story, mode = pick_story_to_post(con, now)
+        if not story:
+            break
+        if looks_already_posted(story["title"], posted_titles):
+            print(f"[poster] guard: already posted, skipping: {story['title'][:50]}")
+            con.execute("UPDATE digests SET posted=1 WHERE url=?", (story["url"],))
+            con.commit()
+            story = None
+            continue
+        break
     if not story:
         pending = con.execute("SELECT COUNT(*) FROM digests WHERE posted=0").fetchone()[0]
         print(f"[poster] queue empty for mode '{mode}' — nothing to post "
@@ -1779,8 +1422,6 @@ def run_poster():
         "sources": json.loads(story["sources"]) if story["sources"] else [story["source"]],
         "source_count": story["source_count"] or 1,
         "full_text": story.get("full_text") or "",
-        "category": story.get("category") or "",
-        "hashtags": json.loads(story["hashtags"]) if story.get("hashtags") else [],
     }
 
     # Regenerate the card now — the collector ran on a different machine,
@@ -1807,66 +1448,30 @@ def run_poster():
     else:
         card_path = story["card_path"]  # fallback to stored path
 
-    feed_result = post_one_to_facebook(item, card_path, token, page_id)
-    feed_status = feed_result.get("status")
-    if feed_status == "success":
-        fb_post_id = feed_result["fb_post_id"]
-        # Commit confirmed feed state before any Reel work. If rendering or
-        # uploading the Reel fails, the feed must never return to the queue.
-        con.execute(
-            "UPDATE digests "
-            "SET posted=1, posted_at=?, fb_post_id=?, reel_posted=0, "
-            "review_needed=0 WHERE url=?",
-            (now.isoformat(), fb_post_id, story["url"]),
-        )
+    ok = post_one_to_facebook(item, card_path, token, page_id)
+    if ok:
+        con.execute("UPDATE digests SET posted=1, posted_at=? WHERE url=?",
+                    (now.isoformat(), story["url"]))
         con.commit()
+        log_posted(story["url"], story["title"])
         pending = con.execute("SELECT COUNT(*) FROM digests WHERE posted=0").fetchone()[0]
-        print(f"[poster] feed posted ✓ id={fb_post_id} "
-              f"({pending} still pending)")
+        print(f"[poster] posted ✓  ({pending} still pending)")
 
         # Every posted story gets a Reel: at 6 posts/day (+6 reels = 12
         # actions/day) we're far under the spam threshold, so no score gate.
-        # This is a single attempt: failed Reels are logged but never retried.
         if POST_REELS and REELS_AVAILABLE and card_path:
-            reel_ok = False
             try:
                 h = hashlib.md5(story["url"].encode()).hexdigest()[:8]
                 reel_path = make_reel(card_path, out_dir="reels",
                                       filename=f"reel_{h}.mp4")
                 if reel_path:
-                    reel_ok = post_reel_to_facebook(
-                        item, reel_path, token, page_id
-                    )
+                    post_reel_to_facebook(item, reel_path, token, page_id)
                 else:
-                    print("[poster] REEL FAILED: render returned nothing; "
-                          "no automatic retry")
+                    print("[poster] reel render returned nothing")
             except Exception as re:
-                print(f"[poster] REEL FAILED: {re}; no automatic retry")
-            if reel_ok:
-                con.execute(
-                    "UPDATE digests SET reel_posted=1 WHERE url=?",
-                    (story["url"],),
-                )
-                con.commit()
-                print("[poster] reel state saved ✓")
-            else:
-                print("[poster] REEL NOT POSTED; feed remains posted and "
-                      "will not be retried")
-    elif feed_status == "ambiguous_failure":
-        con.execute(
-            "UPDATE digests SET review_needed=1, posted=0 WHERE url=?",
-            (story["url"],),
-        )
-        con.commit()
-        print("[poster] REVIEW REQUIRED: feed outcome ambiguous; story "
-              "quarantined from automatic reposting")
+                print(f"[poster] reel step failed: {re}")
     else:
-        con.execute(
-            "UPDATE digests SET review_needed=0, posted=0 WHERE url=?",
-            (story["url"],),
-        )
-        con.commit()
-        print("[poster] clean feed failure — left in queue for next run")
+        print("[poster] post failed — left in queue for next hour")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1892,8 +1497,8 @@ def run_weather():
     if not card_path:
         print("[weather] could not build weather card — skipping")
         return
-    # post the card image with its deterministic forecast caption
-    ok = _post_card_with_caption(card_path, caption, token, page_id)
+    # post the card image only — no caption (the card is self-contained)
+    ok = _post_card_with_caption(card_path, "", token, page_id)
     print("[weather] posted ✓" if ok else "[weather] post failed")
 
 

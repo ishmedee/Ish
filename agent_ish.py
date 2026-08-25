@@ -166,12 +166,7 @@ MAX_ARTICLES_PER_RUN = 12        # cost & noise control
 MAX_PER_SOURCE = 6               # candidates per outlet per run (prefilter
                                  # is the cost gate, so a wide net is cheap)
 MIN_ARTICLE_CHARS = 400          # skip stubs/photo posts
-# Two-tier models: Opus 5 writes (best Mongolian quality where readers see
-# it); Sonnet 5 judges (cheap classification: prefilter, dedup, clustering).
-# Sonnet 5 is also CHEAPER than the old Sonnet 4.6 ($2/$10 vs $3/$15).
-MODEL_SMART = "claude-opus-5"    # summarize + synthesize (reader-facing text)
-MODEL_FAST  = "claude-sonnet-5"  # prefilter, dedup, cluster-confirm
-MODEL = MODEL_FAST               # legacy alias (safety for any missed ref)
+MODEL = "claude-sonnet-4-6" # cheap + good enough for summaries
 DB_PATH = "towch.db"
 OUTPUT_JSON = "digest.json"      # the website reads this file
 REQUEST_TIMEOUT = 15
@@ -549,7 +544,7 @@ def _parse_json_lenient(raw):
 
 def summarize(client, source_name, text):
     msg = client.messages.create(
-        model=MODEL_SMART,
+        model=MODEL,
         max_tokens=2200,   # headroom for the 2-3 paragraph full_text
                            # (truncation kills the whole story's JSON)
         messages=[{
@@ -611,7 +606,7 @@ def cluster_candidates(client, articles):
                             for i, a in enumerate(g))
         try:
             msg = client.messages.create(
-                model=MODEL_FAST,
+                model=MODEL,
                 max_tokens=200,
                 messages=[{"role": "user", "content":
                     "Доорх гарчгууд ИЖИЛ үйл явдлыг мэдээлж байна уу? "
@@ -670,7 +665,7 @@ def synthesize_cluster(client, cluster):
     for a in cluster:
         blocks.append(f"--- Эх сурвалж: {a['src']} ---\n{a['text'][:4000]}")
     msg = client.messages.create(
-        model=MODEL_SMART,
+        model=MODEL,
         max_tokens=2200,   # headroom for the 2-3 paragraph full_text
         messages=[{"role": "user", "content": SYNTH_PROMPT.format(
             cats="/".join(CATEGORIES),
@@ -972,7 +967,7 @@ def is_duplicate_of_recent(client, con, new_title, new_bullets, days=3):
     )
     try:
         msg = client.messages.create(
-            model=MODEL_FAST,
+            model=MODEL,
             max_tokens=30,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -1019,7 +1014,7 @@ def prefilter_political_titles(client, candidates):
     )
     try:
         msg = client.messages.create(
-            model=MODEL_FAST,
+            model=MODEL,
             max_tokens=400,
             messages=[{"role": "user", "content": prompt}],
         )

@@ -844,9 +844,10 @@ def write_json(con):
     today = datetime.now(UB_TZ).date().isoformat()
     rows = con.execute(
         "SELECT url, source, category, title, bullets, why, orig_min, "
-        "published, sources, source_count, all_urls "
+        "published, sources, source_count, all_urls, full_text, "
+        "interest_score, posted "
         "FROM digests WHERE run_at LIKE ? "
-        "ORDER BY source_count DESC, published DESC",
+        "ORDER BY interest_score DESC, published DESC",
         (today + "%",),
     ).fetchall()
     items = [{
@@ -856,6 +857,9 @@ def write_json(con):
         "sources": json.loads(r[8]) if r[8] else [r[1]],
         "sourceCount": r[9] or 1,
         "allUrls": json.loads(r[10]) if r[10] else [r[0]],
+        "fullText": r[11] or "",
+        "interestScore": r[12],
+        "posted": bool(r[13]),
     } for r in rows]
     payload = {
         "generated": datetime.now(UB_TZ).isoformat(),
@@ -914,6 +918,49 @@ def _title_similarity(a, b):
     return inter / union if union else 0.0
 
 
+def _number_fingerprint(text):
+    """
+    Distinctive numbers in a story (free same-event signal). Two outlets
+    covering one press release word their headlines differently but quote
+    the same figures (e.g. 173 cases, 2,779 victims, 211.1bn). Keeps only
+    'strong' numbers: decimals, or 3+ digits — excluding years (1990-2035)
+    and round figures (x00) that recur across unrelated stories.
+    """
+    out = set()
+    for tok in re.findall(r"\d[\d,.]*\d|\d", text or ""):
+        tok = tok.replace(",", "").rstrip(".")
+        if not tok:
+            continue
+        has_dec = "." in tok
+        digits = tok.replace(".", "")
+        if not has_dec and len(digits) < 3:
+            continue
+        if not has_dec:
+            try:
+                v = int(digits)
+            except ValueError:
+                continue
+            if 1990 <= v <= 2035 or v % 100 == 0:
+                continue
+        out.add(tok)
+    return out
+
+
+def _story_text(title, bullets):
+    """Title + bullets as one string (bullets may be list or JSON text)."""
+    if isinstance(bullets, str):
+        try:
+            bullets = json.loads(bullets)
+        except Exception:
+            bullets = [bullets]
+    return " ".join([title or ""] + list(bullets or []))
+
+
+def same_event_by_numbers(text_a, text_b, min_shared=2):
+    """True if two stories share >= min_shared distinctive numbers."""
+    return len(_number_fingerprint(text_a) & _number_fingerprint(text_b)) >= min_shared
+
+
 def is_duplicate_of_recent(client, con, new_title, new_bullets, days=3):
     """
     Two-stage dedup to minimise AI cost:
@@ -926,7 +973,7 @@ def is_duplicate_of_recent(client, con, new_title, new_bullets, days=3):
     """
     cutoff = (datetime.now(UB_TZ).date() - timedelta(days=days)).isoformat()
     rows = con.execute(
-        "SELECT title FROM digests "
+        "SELECT title, bullets FROM digests "
         "WHERE collected_date >= ? OR posted=1 "
         "ORDER BY run_at DESC LIMIT 80", (cutoff,)
     ).fetchall()
@@ -937,6 +984,14 @@ def is_duplicate_of_recent(client, con, new_title, new_bullets, days=3):
     # exact match — free, instant
     if new_title in recent:
         return True
+
+    # number fingerprint — free: same figures = same event, even when the
+    # headlines share few words (the housing-fraud double in Sept 2026)
+    new_text = _story_text(new_title, new_bullets)
+    for t, b in rows:
+        if t and same_event_by_numbers(new_text, _story_text(t, b)):
+            print(f"[dedup] number-fingerprint match: {t[:50]}")
+            return True
 
     # Stage 1: free similarity scoring
     scored = sorted(
@@ -1411,6 +1466,19 @@ def looks_already_posted(title, posted_titles, threshold=0.5):
     return any(_title_similarity(title, t) >= threshold for t in posted_titles)
 
 
+def matches_recent_post_numbers(con, story, days=7):
+    """True if the story shares distinctive figures with a recent post."""
+    cutoff = (datetime.now(UB_TZ) - timedelta(days=days)).isoformat()
+    txt = _story_text(story.get("title"), story.get("bullets"))
+    for t, b in con.execute(
+            "SELECT title, bullets FROM digests WHERE posted=1 "
+            "AND url != ? AND (posted_at IS NULL OR posted_at >= ?)",
+            (story["url"], cutoff)).fetchall():
+        if same_event_by_numbers(txt, _story_text(t, b)):
+            return True
+    return False
+
+
 def run_poster():
     now = datetime.now(UB_TZ)
     print(f"\n===== Иш POSTER run @ {now.isoformat()} =====")
@@ -1432,7 +1500,8 @@ def run_poster():
         story, mode = pick_story_to_post(con, now)
         if not story:
             break
-        if looks_already_posted(story["title"], posted_titles):
+        if looks_already_posted(story["title"], posted_titles) or \
+                matches_recent_post_numbers(con, story):
             print(f"[poster] guard: already posted, skipping: {story['title'][:50]}")
             con.execute("UPDATE digests SET posted=1 WHERE url=?", (story["url"],))
             con.commit()

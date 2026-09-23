@@ -166,7 +166,10 @@ MAX_ARTICLES_PER_RUN = 12        # cost & noise control
 MAX_PER_SOURCE = 6               # candidates per outlet per run (prefilter
                                  # is the cost gate, so a wide net is cheap)
 MIN_ARTICLE_CHARS = 400          # skip stubs/photo posts
-MODEL = "claude-sonnet-4-6" # cheap + good enough for summaries
+MODEL = "claude-opus-5-5"   # thinking can't be disabled on this model, so
+                            # every max_tokens below is a generous CEILING
+                            # (thinking counts against it; you only pay for
+                            # tokens actually used)
 DB_PATH = "towch.db"
 OUTPUT_JSON = "digest.json"      # the website reads this file
 REQUEST_TIMEOUT = 15
@@ -545,7 +548,7 @@ def _parse_json_lenient(raw):
 def summarize(client, source_name, text):
     msg = client.messages.create(
         model=MODEL,
-        max_tokens=2200,   # headroom for the 2-3 paragraph full_text
+        max_tokens=8000,   # thinking + 2-3 paragraph full_text JSON
                            # (truncation kills the whole story's JSON)
         messages=[{
             "role": "user",
@@ -607,7 +610,7 @@ def cluster_candidates(client, articles):
         try:
             msg = client.messages.create(
                 model=MODEL,
-                max_tokens=200,
+                max_tokens=2000,   # thinking + tiny yes/no
                 messages=[{"role": "user", "content":
                     "Доорх гарчгууд ИЖИЛ үйл явдлыг мэдээлж байна уу? "
                     "Зөвхөн JSON-оор хариул: бодит нэг үйл явдлыг хамтад нь "
@@ -666,7 +669,7 @@ def synthesize_cluster(client, cluster):
         blocks.append(f"--- Эх сурвалж: {a['src']} ---\n{a['text'][:4000]}")
     msg = client.messages.create(
         model=MODEL,
-        max_tokens=2200,   # headroom for the 2-3 paragraph full_text
+        max_tokens=8000,   # thinking + 2-3 paragraph full_text JSON
         messages=[{"role": "user", "content": SYNTH_PROMPT.format(
             cats="/".join(CATEGORIES),
             articles="\n\n".join(blocks),
@@ -968,7 +971,7 @@ def is_duplicate_of_recent(client, con, new_title, new_bullets, days=3):
     try:
         msg = client.messages.create(
             model=MODEL,
-            max_tokens=30,
+            max_tokens=2000,   # thinking + {"duplicate":..}
             messages=[{"role": "user", "content": prompt}],
         )
         raw = "".join(b.text for b in msg.content if b.type == "text")
@@ -1015,7 +1018,7 @@ def prefilter_political_titles(client, candidates):
     try:
         msg = client.messages.create(
             model=MODEL,
-            max_tokens=400,
+            max_tokens=4000,   # thinking + score array
             messages=[{"role": "user", "content": prompt}],
         )
         raw = "".join(b.text for b in msg.content if b.type == "text")
@@ -1050,12 +1053,45 @@ def prefilter_political_titles(client, candidates):
     return kept
 
 
+# ── Token/cost tracking (to measure the Opus 5.5 switch) ──────
+PRICE_IN, PRICE_OUT = 4.0, 20.0   # USD per 1M tokens, claude-opus-5-5
+_USAGE = {"calls": 0, "in": 0, "out": 0, "truncated": 0}
+
+
+def _install_usage_tracker(client):
+    """Wrap client.messages.create to tally tokens and flag truncation."""
+    orig = client.messages.create
+
+    def tracked(*a, **k):
+        msg = orig(*a, **k)
+        try:
+            _USAGE["calls"] += 1
+            _USAGE["in"] += msg.usage.input_tokens
+            _USAGE["out"] += msg.usage.output_tokens
+            if getattr(msg, "stop_reason", "") == "max_tokens":
+                _USAGE["truncated"] += 1
+                print("[usage] WARNING: a call hit max_tokens (truncated)")
+        except Exception:
+            pass
+        return msg
+
+    client.messages.create = tracked
+
+
+def print_usage_report():
+    cost = (_USAGE["in"] * PRICE_IN + _USAGE["out"] * PRICE_OUT) / 1e6
+    print(f"[usage] {_USAGE['calls']} calls | in {_USAGE['in']:,} tok | "
+          f"out {_USAGE['out']:,} tok (incl. thinking) | "
+          f"truncated {_USAGE['truncated']} | est ${cost:.3f}")
+
+
 def run_collector():
     now = datetime.now(UB_TZ)
     today = now.date().isoformat()
     print(f"\n===== Иш COLLECTOR run @ {now.isoformat()} =====")
 
     client = Anthropic()  # uses ANTHROPIC_API_KEY env var
+    _install_usage_tracker(client)
     con = db_init()
     print(f"[config] cards={CARDS_AVAILABLE}")
 
@@ -1217,6 +1253,7 @@ def run_collector():
     con.commit()
 
     pending = con.execute("SELECT COUNT(*) FROM digests WHERE posted=0").fetchone()[0]
+    print_usage_report()
     print(f"[collector] {queued} queued ({skipped_ads} ads skipped, "
           f"{merged} multi-source); {dropped} stale dropped; "
           f"{pending} total pending in queue")

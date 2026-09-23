@@ -246,12 +246,17 @@ true бол — жинхэнэ мэдээ: улс төр, эдийн засаг,
   түүнчлэн спорт, соёл, хүн сонирхсон зөөлөн мэдээ ч мөн true.
 Эргэлзвэл true. Зорилго: зар, хоосон PR-ийг шүүх, бодит мэдээг үлдээх.
 
-"political" (0-100): энэ мэдээ МОНГОЛЫН УЛС ТӨРД хэр холбоотой вэ? Өндөр оноо:
-  УИХ, Засгийн газар, Ерөнхийлөгч, сайд/албан тушаалтан, намууд, сонгууль,
-  хууль/бодлого, авлига, томилгоо, улс төрийн дуулиан, жагсаал/эсэргүүцэл,
-  улс төртэй холбоотой нийгмийн асуудал, Монголын гадаад харилцаа/дипломат.
-  Бага оноо: спорт, зугаа цэнгээл, технологийн бүтээгдэхүүн, цэвэр бизнес,
-  алдартны мэдээ — улс төртэй огт хамаагүй бол 0-10.
+"political" (0-100): МОНГОЛЫН УЛС ТӨРИЙН ЭРСДЭЛТЭЙ, ХУРЦ мэдээ мөн үү?
+  Өндөр (70-100): авлига, дуулиан, албан тушаалтныг буруутгасан/шалгасан/
+  огцруулсан, АТГ/прокурор/шүүхийн хэрэгт холбогдсон улс төрч, намын дотоод
+  тэмцэл, итгэл үзүүлэх/огцрох асуудал, улс төрчдийн хоорондын зөрчил,
+  олны дургүйцэл төрүүлсэн шийдвэр, иргэдийн мөнгөнд (татвар, тэтгэвэр,
+  цалин, тариф) шууд нөлөөлөх төрийн шийдвэр.
+  Дунд (35-65): бодит үр дагавартай хууль, төсөв, бодлогын хэлэлцүүлэг.
+  Бага (0-25): улс төртэй холбоотой ч ЯМАР Ч ЗӨРЧИЛ, ЭРСДЭЛГҮЙ журмын/ёслолын
+  мэдээ — хурал зарлагдсан/нээгдсэн, уулзалт, айлчлал, форум, санамж бичиг,
+  тоног төхөөрөмж гардуулсан, шагнал, баяр ёслол, албан мэдэгдэл.
+  Спорт, зугаа цэнгээл, цэвэр бизнес, алдартны мэдээ = 0-10.
 "mongolia_related" (true/false): энэ мэдээ Монгол Улстай ШУУД холбоотой юу?
   Гадаадын мэдээ бол зөвхөн Монголыг шууд хамарсан үед true (жишээ:
   Монгол-хятадын хэлэлцээр). Монголтой хамаагүй цэвэр гадаад мэдээ = false.
@@ -262,13 +267,16 @@ true бол — жинхэнэ мэдээ: улс төр, эдийн засаг,
 "emotional" (0-100): нийгмийн сүлжээнд хэр их анхаарал татах вэ —
   хүмүүс хуваалцаж, сэтгэгдэл бичиж, маргалдах уу? Өндөр: дуулиан, зөрчил,
   авлига, гэмт хэрэг, осол, огцруулалт, иргэдийн мөнгөнд нөлөөлөх шийдвэр,
-  гэнэтийн эргэлт, хүний хувь заяаны драм. Бага: ёслол, шагнал, форум,
-  албан ёсны хуурай мэдээ.
+  гэнэтийн эргэлт, хүний хувь заяаны драм. Бага (0-15): ёслол, шагнал,
+  форум, хурал зарлах, уулзалт, гардуулалт, албан ёсны хуурай мэдээ.
 "block" (ЦӨӨХӨН тохиолдолд true): зөвхөн дараах тохиолдолд true —
   цуст/аймшигт дүрслэл, гамшиг/золгүй явдлын хохирогчийг мөлжсөн,
   баталгаагүй гүтгэлэг/нэр төр гутаах, үзэн ядалт өдөөсөн контент.
   Бусад бүх тохиолдолд false. Энэ нь зөвхөн хуудсыг хоригдохоос хамгаалах
   доод хязгаар — ердийн сэтгэл хөдөлгөм, дуулиантай мэдээг блоклохгүй.
+
+ОГНОО: өнөөдөр {today}. Он, сар, өдрийг нийтлэлд бичсэнээр нь л бич.
+Нийтлэлд он заагаагүй бол өөрөө он НЭМЖ БИЧИХГҮЙ.
 
 Нийтлэл ({source}):
 {text}"""
@@ -554,6 +562,7 @@ def summarize(client, source_name, text):
             "role": "user",
             "content": PROMPT.format(
                 cats="/".join(CATEGORIES),
+                today=datetime.now(UB_TZ).date().isoformat(),
                 source=source_name,
                 text=text[:8000],
             ),
@@ -644,21 +653,25 @@ SYNTH_PROMPT = """Чи Монголын мэдээг энгийн ойлгомж
  "mongolia_related": true/false,
  "block": true/false}}
 
-"political" (0-100): Монголын улс төрд хэр холбоотой вэ? УИХ, Засгийн газар,
-  Ерөнхийлөгч, сайд, намууд, сонгууль, хууль/бодлого, авлига, томилгоо,
-  улс төрийн дуулиан, жагсаал, Монголын гадаад харилцаа = өндөр. Спорт,
-  зугаа цэнгээл, цэвэр бизнес = 0-10.
+"political" (0-100): Монголын улс төрийн эрсдэлтэй, хурц мэдээ мөн үү?
+  Өндөр: авлига, дуулиан, албан тушаалтныг буруутгасан/шалгасан/огцруулсан,
+  намын дотоод тэмцэл, итгэл үзүүлэх/огцрох, улс төрчдийн зөрчил, иргэдийн
+  мөнгөнд шууд нөлөөлөх шийдвэр. Дунд: бодит үр дагавартай хууль, төсөв.
+  Бага (0-25): зөрчилгүй журмын/ёслолын мэдээ (хурал зарлах, уулзалт,
+  айлчлал, форум, гардуулалт, шагнал). Спорт, зугаа цэнгээл = 0-10.
 "mongolia_related" (true/false): Монгол Улстай шууд холбоотой юу? Гадаад
   мэдээ бол зөвхөн Монголыг шууд хамарсан үед true, эс бол false.
 "importance" (0-100): хүмүүсийн амьдрал, мөнгө, ажил, аюулгүй байдалд
   хэр нөлөөлөх вэ (бодлого, хууль, эдийн засаг = өндөр).
 "emotional" (0-100): нийгмийн сүлжээнд хэр их анхаарал татах вэ
   (дуулиан, зөрчил, авлига, осол, иргэдийн мөнгөнд нөлөөлөх = өндөр;
-  ёслол, форум, албан хуурай мэдээ = бага).
+  ёслол, форум, хурал зарлах, уулзалт, албан хуурай мэдээ = 0-15).
 "block" (зөвхөн цөөхөн): цуст/аймшигт дүрслэл, золгүй явдлын хохирогчийг
   мөлжсөн, баталгаагүй гүтгэлэг, үзэн ядалт өдөөсөн л бол true. Бусад false.
 
 Эх сурвалжууд зөрчилтэй мэдээлэл өгвөл түүнийг тэмдэглэ.
+ОГНОО: өнөөдөр {today}. Он, сар, өдрийг нийтлэлд бичсэнээр нь л бич.
+Нийтлэлд он заагаагүй бол өөрөө он НЭМЖ БИЧИХГҮЙ.
 {articles}"""
 
 
@@ -672,6 +685,7 @@ def synthesize_cluster(client, cluster):
         max_tokens=8000,   # thinking + 2-3 paragraph full_text JSON
         messages=[{"role": "user", "content": SYNTH_PROMPT.format(
             cats="/".join(CATEGORIES),
+            today=datetime.now(UB_TZ).date().isoformat(),
             articles="\n\n".join(blocks),
         )}],
     )
@@ -688,23 +702,43 @@ FB_API = "https://graph.facebook.com/v23.0"
 FB_MAX_POSTS = 3
 
 
+def clean_source_names(sources):
+    """'tovch.mn-pol','tovch.mn-soc' -> 'tovch.mn' (deduped, order kept)."""
+    out = []
+    for s in sources or []:
+        s = re.sub(r"-(pol|soc|eco)$", "", str(s).strip())
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+CATEGORY_HASHTAG = {
+    "Улс төр": "#улстөр", "Эдийн засаг": "#эдийнзасаг", "Нийгэм": "#нийгэм",
+    "Технологи": "#технологи", "Спорт": "#спорт", "Дэлхий": "#дэлхий",
+}
+
+# Fixed, human-checked wording (not AI-generated) so there's no grammar risk.
+COMMENT_PROMPTS = [
+    "Та энэ талаар юу гэж бодож байна? Сэтгэгдлээ үлдээгээрэй.",
+    "Энэ асуудлыг та хэрхэн харж байна вэ?",
+    "Санал бодлоо сэтгэгдэл хэсэгт хуваалцаарай.",
+]
+COMMENT_PROMPT_MIN_SCORE = 60   # only on high-stakes stories
+
+
 def build_caption(item):
     """
-    Compose the Facebook post text (caption above the card image).
-    Uses the elaborated `full_text` for depth when available, then the
-    key bullets, the 'why it matters' line, sources, and hashtags.
-    The CARD image itself is unchanged — this only affects post text.
+    Compose the Facebook post text (caption above the card / Reel).
+    full_text depth, bullets, why-line, an optional comment prompt on
+    high-stakes stories, clean source names, category hashtag.
     """
     lines = [item["title"], ""]
 
-    # Elaborated write-up (the new richer text). Falls back gracefully
-    # to bullets-only if an older queued item lacks full_text.
     full = (item.get("full_text") or "").strip()
     if full:
         lines.append(full)
         lines.append("")
 
-    # Key points as bullets (kept — they scan well on mobile)
     for b in item["bullets"]:
         lines.append(f"• {b}")
 
@@ -712,12 +746,19 @@ def build_caption(item):
         lines.append("")
         lines.append(f"💡 Яагаад чухал вэ? {item['why']}")
 
+    if (item.get("interest_score") or 0) >= COMMENT_PROMPT_MIN_SCORE:
+        h = int(hashlib.md5(item["url"].encode()).hexdigest(), 16)
+        lines.append("")
+        lines.append(f"💬 {COMMENT_PROMPTS[h % len(COMMENT_PROMPTS)]}")
+
     lines.append("")
-    srcs = ", ".join(item.get("sources", [item.get("source", "")]))
+    srcs = ", ".join(clean_source_names(
+        item.get("sources") or [item.get("source", "")]))
     lines.append(f"📰 Эх сурвалж: {srcs}")
     lines.append(f"🔗 {item['url']}")
     lines.append("")
-    lines.append("#Иш #мэдээ #улстөр")
+    tag = CATEGORY_HASHTAG.get(item.get("category", ""), "")
+    lines.append(" ".join(t for t in ["#ИшТойм", "#мэдээ", tag] if t))
     return "\n".join(lines)
 
 
@@ -1055,17 +1096,17 @@ def prefilter_political_titles(client, candidates):
         "Чи Монголын мэдээний редактор. Доорх гарчиг бүрд 'ХАЛУУН МЭДЭЭ' "
         "оноо (0-100) өг: уншигчид хэр их анхаарал хандуулж, хуваалцаж, "
         "сэтгэгдэл бичих вэ?\n\n"
-        "ӨНДӨР (70-100): МОНГОЛЫН УЛС ТӨР — УИХ, Засгийн газар, Ерөнхийлөгч, "
-        "сайд, намуудын шийдвэр үйл ажиллагаа; улс төрийн дуулиан, авлига, "
-        "огцруулалт/томилгоо, сонгууль, хууль бодлого, жагсаал эсэргүүцэл; "
-        "мөн иргэдийн мөнгөнд шууд нөлөөлөх төрийн шийдвэр (татвар, тэтгэвэр, "
-        "цалин, тариф).\n"
-        "ДУНД (40-65): Монголын эдийн засаг банк санхүү; улс төртэй "
-        "холбоогүй ч том нийгмийн үйл явдал (ноцтой гэмт хэрэг, осол, "
-        "тулгамдсан асуудал — орон сууц, эрүүл мэнд, боловсрол).\n"
-        "БАГА (0-25): ёслол хүндэтгэл, шагнал гардуулалт, форум чуулган "
-        "нээлт, байгууллагын PR, ердийн урьдчилсан мэдээ, спортын хуваарь, "
-        "зар сурталчилгаа.\n\n"
+        "ӨНДӨР (70-100): улс төрийн ДУУЛИАН, эрсдэлтэй мэдээ — авлига, "
+        "албан тушаалтныг буруутгасан/шалгасан/огцруулсан, АТГ/прокурор/шүүхэд "
+        "холбогдсон улс төрч, намын дотоод тэмцэл, итгэл үзүүлэх/огцрох, "
+        "улс төрчдийн хурц зөрчил; иргэдийн мөнгөнд шууд нөлөөлөх шийдвэр "
+        "(татвар, тэтгэвэр, цалин, тариф); олны анхаарал татсан хүнд гэмт хэрэг.\n"
+        "ДУНД (35-60): бодит үр дагавартай хууль, төсөв, бодлогын хэлэлцүүлэг; "
+        "Монголын эдийн засаг; том нийгмийн асуудал.\n"
+        "БАГА (0-20): улс төртэй холбоотой байсан ч ЗӨРЧИЛГҮЙ журмын/ёслолын "
+        "мэдээ — хурал зарлагдсан/нээгдсэн, уулзалт, айлчлал, форум, санамж "
+        "бичиг, тоног төхөөрөмж гардуулсан, шагнал, баяр ёслол; мөн PR, зар, "
+        "спорт, зугаа цэнгээл.\n\n"
         f"Гарчигууд:\n{numbered}\n\n"
         "ЗӨВХӨН JSON массив буцаа, гарчиг тус бүрийн оноогоор дарааллаар: "
         "[оноо1, оноо2, ...] (өөр юу ч бичихгүй)."
@@ -1264,7 +1305,10 @@ def run_collector():
             # POLITICS-LED blend (reverted from attention-led): political
             # weight dominates, viral pull second, impact third — the page
             # is first and foremost a Mongolian politics outlet.
-            interest = min(100, round(0.50 * pol + 0.30 * emo + 0.20 * imp)
+            # (Sept 2026 report: conflict/scandal Reels median 1,776 views vs
+            #  345 for procedural politics.) `political` now scores politics
+            #  WITH STAKES, so stakes and scandal pull are weighted equally.
+            interest = min(100, round(0.40 * pol + 0.40 * emo + 0.20 * imp)
                            + multi_boost + econ_boost)
 
             # No card render here: the poster regenerates the card on its
@@ -1520,7 +1564,10 @@ def run_poster():
         "bullets": json.loads(story["bullets"]) if story["bullets"] else [],
         "why": story["why"] or "",
         "url": story["url"],
-        "sources": json.loads(story["sources"]) if story["sources"] else [story["source"]],
+        "sources": clean_source_names(
+            json.loads(story["sources"]) if story["sources"] else [story["source"]]),
+        "category": story.get("category", ""),
+        "interest_score": story.get("interest_score") or 0,
         "source_count": story["source_count"] or 1,
         "full_text": story.get("full_text") or "",
     }

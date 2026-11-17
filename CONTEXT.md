@@ -9,10 +9,11 @@ Automated Mongolian news service. Scrapes Mongolian news sites → Claude API fi
 - Scheduler: **cron-job.org only** (GitHub's native cron never fires reliably for this private repo). Each job POSTs to the workflow_dispatch endpoint with `{"ref":"main","inputs":{"mode":"<mode>"}}`.
 - Secrets (GitHub Actions env): `ANTHROPIC_API_KEY`, `FB_PAGE_TOKEN` (permanent, never-expiring page token), `FB_PAGE_ID`. Never hardcode.
 - Meta app "Ish Poster" is in **Live mode** (required for API posts to be publicly visible; Development mode restricted their audience). Privacy policy at `privacy.html` hosted via GitHub Pages was required to go Live.
-- Claude model string: `claude-sonnet-4-6`.
+- Claude model string: `claude-opus-5-5` (thinking always on → every `max_tokens` is a generous ceiling; `[usage]` line prints tokens + est. cost per collect run).
 
 ## Files
-- `agent_ish.py` — main (~1480 lines). All modes + scraping + scoring + dedup + FB posting + proxy infra.
+- `agent_ish.py` — main (~2400 lines). All modes + scraping + scoring + dedup + FB posting + insights + proxy infra.
+- `posted_log.txt` — append-only `url<TAB>title<TAB>date` record of successful feed posts; committed every run by digest.yml; the poster's durable repost guard.
 - `card.py` — PNG card renderers, 1080×1350. `make_card` (news), `make_weather_card`, `make_currency_card`. Uses Pillow. Handles Mongolian font detection.
 - `reel.py` — `make_reel(card_path,...)`: card→10s vertical 1080×1920 MP4 (subtle zoom + music bed) via ffmpeg.
 - `weather.py` — Open-Meteo fetch + `make_weather_post`.
@@ -26,77 +27,86 @@ Automated Mongolian news service. Scrapes Mongolian news sites → Claude API fi
 - `post` → `run_poster()`
 - `weather` → `run_weather()`
 - `currency` → `run_currency()`
+- `insights` → `run_insights()` (weekly; reads Reel plays + avg watch time from the Graph API into `views`/`avg_watch_s`; prints hit rate by topic / score band / card length). Needs `read_insights` + `pages_manage_engagement` on the page token.
 
 ## Current schedule (cron-job.org, Asia/Ulaanbaatar) — overlapping runs are serialized by the **[C-04] `ish-digest` workflow concurrency group** (`cancel-in-progress: false`), so they queue instead of colliding
 | Job | Cron | Times |
 |-----|------|-------|
 | Weather | `45 6 * * *` | 06:45 daily |
 | Currency | `50 6 * * 1-5` | 06:50 weekdays (rates don't change weekends) |
-| Poster | `0 7,11,15,17,18,19 * * *` | 07,11,15,17,18,19 on the hour |
-| Collector | `0 6,14 * * *` | 06:00, 14:00 daily |
+| Collector | `15 10,16 * * *` | 10:15, 16:15 daily (was 11:30/16:30; moved so the 11:00 slot gets same-day news) |
+| Poster | `0 1,7,11,15,17,19,21 * * *` | 7 slots/day |
+| Insights | `5 9 * * 1` | Mondays 09:05 |
 
-## Operating strategy (current, final)
-- **6 posts/day**, every post also gets a **Reel** (no score gate — ~12 FB actions/day, under the spam limit that was hit at ~64/day).
-- **Collect 2×/day** (06:00, 14:00), **7 days/week** incl. weekends.
-- **Strict same-day posting** from the 07:00 slot onward, fed by the 06:00 collection. Only posts before 07:00 use the most-recent prior day. Controlled by `FIRST_COLLECTION_HOUR = 7` in `pick_story_to_post`.
-- Editorial: Mongolian **politics primary**; secondary = hot social + Mongolian economy (economy is preferred filler). Foreign news dropped unless directly Mongolia-related.
+## Operating strategy (current — audience-first since 2026-11-18)
+- **7 posts/day**, every post also gets a **Reel** (~14 FB actions/day, under the spam limit hit at ~64/day).
+- **Collect 2×/day** (10:15, 16:15), 7 days/week.
+- **Editorial goal: maximum reach, follows and interactions** — no politics quota. Selection follows what the page's audience responded to in the Aug 27–Nov 17 2026 Facebook data (523 Reels): human drama, confrontation/scandal, smuggling/fraud and personal-money stories win; procedural politics and court-date stories lose. Foreign news dropped unless directly Mongolia-related.
+- **Fresh only**: stories older than 2 days are never posted. **Thread fatigue cap**: ≤2 posts per running story in 4 days unless a breakout (score ≥75). **Short cards**: ≤600 chars, headline ≤80.
 
 ## Key constants (agent_ish.py)
-- `MODEL = "claude-sonnet-4-6"`
-- `MAX_PER_SOURCE = 6` (candidates fetched per source per run)
-- `MAX_ARTICLES_PER_RUN = 12` (legacy, unused; candidate list capped at 40 via source-balanced round-robin in `collect_candidates` — no source-order slicing; prefilter is the real gate)
+- `MODEL = "claude-opus-5-5"`
+- `MAX_PER_SOURCE = 6` default; `SOURCE_MAX` per-source overrides (zarig/eguur 8, MONTSAME 3/3/2, tovch 3/3) via `source_cap(src)`; total still capped at 40 by round-robin
+- `MAX_ARTICLES_PER_RUN = 12` (legacy, unused)
 - `MIN_ARTICLE_CHARS = 400` (skip stubs)
 - `MAX_FETCH_ATTEMPTS = 3`; `FETCH_RETRY_MAX_AGE_DAYS = 2` (bounded cross-run retry for transient article-fetch failures)
 - `MAX_IMAGE_BYTES = 10MB`; `MAX_IMAGE_REDIRECTS = 3`; `MAX_IMAGE_PIXELS = 40M` (article-image SSRF/resource guards)
-- `FIRST_COLLECTION_HOUR = 7`; `MORNING_FRESH_HOUR = 9` (legacy, unused)
-- `MAX_QUEUE_AGE_DAYS = 5` (drop stale unposted)
+- `FIRST_COLLECTION_HOUR = 11` (slots before 11:00 draw on the prior day's batch); `MORNING_FRESH_HOUR = 9` (legacy, unused)
+- `MAX_QUEUE_AGE_DAYS = 5` (housekeeping delete of stale unposted rows); `MAX_POST_AGE_DAYS = 2` (freshness gate in `pick_story_to_post`)
+- `THREAD_WINDOW_DAYS = 4`, `THREAD_MAX_POSTS = 2`, `THREAD_BREAKOUT_SCORE = 75`
+- `TITLE_MAX_CHARS = 80`, `BULLET_MAX_CHARS = 110`, `WHY_MAX_CHARS = 120`, `CARD_MAX_CHARS = 600`
+- `TOPIC_ADJ` (see Scoring), `HEADLINE_BONUS = 5` + `HEADLINE_BONUS_RE`
+- `COMMENT_PROMPT_MIN_SCORE = 55`, `COMMENT_PROMPT_SKIP_TOPICS = {"human_drama"}`
 - `POST_REELS = env POST_REELS == "1"`
 - `CATEGORIES = ["Улс төр","Эдийн засаг","Нийгэм","Технологи","Спорт","Дэлхий"]`
-- `REEL_MIN_SCORE` — REMOVED (all posts get Reels).
 
 ## SQLite schema — table `digests`
-Columns: `url` (PK), `source`, `category`, `title`, `bullets` (JSON array), `why`, `orig_min`, `published`, `run_at`, `sources` (JSON), `source_count` (int), `all_urls` (JSON), `posted` (0/1), `collected_date` (YYYY-MM-DD), `card_path`, `posted_at`, `interest_score` (int), `full_text` (elaborated caption), `image_url` (article og:image), `fb_post_id` (confirmed FB feed object id), `reel_posted` (0/1; 1 only after Reel upload confirms), `review_needed` (0/1; 1 = ambiguous feed outcome, quarantined from reposting), `hashtags` (JSON array of ≤3 article-specific hashtag tokens, stored WITHOUT the leading `#`; sanitized at collect time).
+Columns: `url` (PK), `source`, `category`, `title`, `bullets` (JSON array), `why`, `orig_min`, `published`, `run_at`, `sources` (JSON), `source_count` (int), `all_urls` (JSON), `posted` (0/1), `collected_date` (YYYY-MM-DD), `card_path`, `posted_at`, `interest_score` (int), `full_text` (elaborated caption), `image_url` (article og:image), `fb_post_id` (confirmed FB feed object id), `reel_posted` (0/1; 1 only after Reel upload confirms), `review_needed` (0/1; 1 = ambiguous feed outcome, quarantined from reposting), `hashtags` (JSON array of ≤3 article-specific hashtag tokens, stored WITHOUT the leading `#`; sanitized at collect time), `topic` (audience topic label), `card_chars` (title+bullets+why length), `reel_video_id`, `views` + `avg_watch_s` + `insights_at` (filled by `insights` mode). `posted`: 0 = pending, 1 = posted, 2 = skipped by the poster's already-covered guard.
 Also table `seen(url)` for dedup of already-processed URLs, plus `fetch_attempts(url PK, attempts, first_seen)` for bounded cross-run retry state after transient article-fetch failures. Tables are created idempotently and `digests` columns are added via the migration loop in `db_init()`.
 
 ## Collector pipeline (`run_collector`)
 1. `collect_candidates(con)` → all sources → list of `(src_dict, title, url)`, capped at 40 by source-balanced round-robin (one candidate per source per round).
 2. **mark ALL candidates seen BEFORE prefilter** (critical: else rejected titles return every run, waste tokens, block per-source quota).
-3. `prefilter_political_titles(client, candidates)` → ONE batch Claude call rating each title 0–100 "hot news" (халуун мэдээ). Keeps **top 6 hot (score ≥30) + 2 filler (<30)**. Returns `(src,title,url,pol_guess)` tuples. On parse error, wrong-length output, or any prefilter exception, the deterministic fallback keeps a source-balanced ≤8 candidates instead of all 40. (This is the main cost gate.)
+3. `prefilter_titles(client, candidates)` → ONE batch Claude call rating each title 0–100 for audience pull (reach/shares/comments/follows). Keeps **top 6 hot (score ≥30) + 2 filler (<30)**. Returns `(src,title,url,pol_guess)` tuples. On parse error, wrong-length output, or any prefilter exception, the deterministic fallback keeps a source-balanced ≤8 candidates instead of all 40. (This is the main cost gate.)
 4. For survivors: `fetch_article_text(url, selector, use_proxy)` → returns `(text, image_url)` where image_url is og:image/twitter:image. Transient fetch failures (exception, empty text, or `<MIN_ARTICLE_CHARS`) use `fetch_attempts` for bounded cross-run retry: maximum 3 attempts or 2 days from the first failure. Only failed survivors are temporarily removed from `seen`; rejected prefilter titles remain seen.
 5. `cluster_candidates` groups same-event articles; `synthesize_cluster` merges multi-source into one summary.
-6. `summarize` (single) or synth (multi) → JSON via `_parse_json_lenient`. Fields: `title, category, bullets[3], why, full_text, hashtags[3], newsworthy, importance(0-100), emotional(0-100), political(0-100), mongolia_related(bool), block(bool)`. **max_tokens=2200** (was 900/1000 — caused truncation that killed stories). `hashtags` = 3 story-specific Mongolian tags (no `#`, no spaces); sanitized by `_clean_hashtags` at collect time and stored in the `hashtags` column.
-7. Filters: skip not-newsworthy, skip `block`, skip foreign not `mongolia_related`.
-8. `is_duplicate_of_recent` cross-run dedup (see below).
-9. Score (see formula), insert into `digests` with `posted=0`, `image_url`, `full_text`, `interest_score`, `collected_date=today`.
-10. `write_json(con)` dumps digest.json; DB committed by workflow.
+6. `summarize` (single) or synth (multi) → JSON via `_parse_json_lenient`. Both share `OUTPUT_SCHEMA` + `SCORING_RULES` (formatted by `_prompt_kwargs()`, incl. today's date rule). Fields: `title (≤80), category, bullets[3] (≤110 each), why (≤120), full_text, hashtags[3], newsworthy, topic, felt_stakes, conflict, novelty (0-100), mongolia_related(bool), block(bool)`. **max_tokens=8000** (Opus thinking counts against it; was 2200 on Sonnet). `hashtags` = 3 story-specific Mongolian tags (no `#`, no spaces); sanitized by `_clean_hashtags` at collect time and stored in the `hashtags` column.
+7. Filters: skip not-newsworthy, skip `block`.
+8. `enforce_card_length`: if the card exceeds 600 chars or the title 80, drop the 3rd bullet if that fixes it, else ONE small Claude call to tighten (falls back to the trimmed version). Runs before dedup so dedup sees the stored title.
+9. `is_duplicate_of_recent` cross-run dedup (see below). Then skip foreign not `mongolia_related`.
+10. `compute_interest` → score + topic; `INSERT OR IGNORE` into `digests` with `posted=0`, `image_url`, `full_text`, `interest_score`, `topic`, `card_chars`, `collected_date=today`.
+11. `write_json(con)` dumps digest.json (incl. `fullText`, `interestScore`, `posted`, `topic`; sorted by score); DB committed by workflow.
 
-## Scoring
-Prefilter (title-only, hot-news triage): HIGH 70-100 = scandals/corruption/dismissals/appointments/protests/crime/accidents/wallet-impact decisions (tax,pension,salary,tariff)/sharp disputes/sudden events. MID 40-65 = real parliamentary work, legislation, economy/banking, pressing social issues, human-interest. LOW 0-25 = ceremonies/awards/forum openings/PR/routine advisories/sports schedules/ads.
+## Scoring (audience-stakes, since 2026-11-18)
+Why: the old blend (political/emotional/importance + economy boost) turned anti-predictive in Oct–Nov 2026 — Spearman(score, views) −0.09; 80+ scores had the worst median (220) and a 4% hit rate.
 
-Interest score (in `run_collector`, attention-led):
+Prefilter (title-only): HIGH 70-100 = human drama (missing/death/accident/child/elderly safety), named officials exposed/accused/sharp disputes/public anger/new arrests, smuggling/big fraud/theft, wallet-impact decisions (pension, salary, benefits, tax, prices, tariffs, fuel, loans). MID 40-65 = practical new rules/schedules ("from date X"), pressing social issues, human-interest, big Mongolian sports wins. LOW 0-25 = meetings, hearings, visits, MoUs, plans, statistics, ceremonies, awards; court dates/postponements/detention extensions of public figures; PR, ads; foreign news unrelated to Mongolia.
+
+Interest score (`compute_interest`):
 ```
-pol = political(0-100); imp = importance; emo = emotional (viral pull)
-multi_boost = min(6, (n_sources-1)*3)      # deliberately small — NOT a multi-source preference
-econ_boost  = 8 if category=="Эдийн засаг" else 0
-interest = min(100, round(0.48*emo + 0.32*pol + 0.20*imp) + multi_boost + econ_boost)
+interest = clamp(round(0.45*felt_stakes + 0.35*conflict + 0.20*novelty)
+                 + TOPIC_ADJ[topic] + (5 if HEADLINE_BONUS_RE matches title) + (3 if multi-source), 0, 100)
+TOPIC_ADJ = human_drama +10, confrontation +8, fraud +8, money +6, practical 0, other 0, procedural -10, courts -15
 ```
-`emotional` prompt = "will people share/comment/argue?" `political` = Mongolian-politics relevance. `importance` = real-life money/jobs/safety impact.
+Hit rates behind the adjustments (Reels >10k views, Aug 27–Nov 17): human drama 27%, confrontation 22%, fraud 20%, money 18%, practical 13%, other 9%, procedural 5%, courts 3%. Headline bonus words (pension/elderly/children/"эхлэн"): 39% hit vs 11%. Re-check monthly with `insights`.
 
 ## Cross-run dedup (`is_duplicate_of_recent`) — 3 tiers, cost-minimizing
 - Free `_title_similarity` (Jaccard word-overlap, words ≥4 chars).
 - `≥0.60` → duplicate (free). `<0.12` → unique (free, common case). `0.12–0.60` → one short Claude call comparing the new story (title + bullets) against the top ~6 similar recent stories (title + stored bullets, each capped 300 chars). "Same event" explicitly includes rewordings / different emphasised numbers / updated tallies of one incident; genuinely new developments are allowed through. Floor is 0.12 (was 0.18) because AI-retitling + Mongolian suffix morphology push real same-event rewordings down to ~0.15 Jaccard.
-- Compares against last ~40 titles from past 3 days (queued or posted). On error → allow through (safe: rare dup > lost story).
+- **Number fingerprint** (free, before the similarity tiers): ≥2 shared distinctive numbers (decimals or 3+ digits, excluding years 1990–2035 and round x00) = same event.
+- Compares against last ~80 stories from past 3 days (queued or posted). On error → allow through (safe: rare dup > lost story).
 
 ## Poster (`run_poster` + `pick_story_to_post`)
-- Select single highest `interest_score` unposted story for the slot. Ordering: `interest_score DESC, (economy first among ties), source_count DESC, collected_date DESC`.
-- Same-day: `now.hour < FIRST_COLLECTION_HOUR(7)` → prior day; else strictly `collected_date=today`, fallback prior only if today empty.
+- `sync_posted_flags_from_log` re-applies posted=1 from `posted_log.txt` (binary DB merges can lose flags).
+- `pick_story_to_post(con, now, exclude)`: highest `interest_score` among `posted=0`, `review_needed=0`, `collected_date >= today-2` (MAX_POST_AGE_DAYS). Ordering: `interest_score DESC, source_count DESC, collected_date DESC` (economy tie-break removed). `now.hour < FIRST_COLLECTION_HOUR(11)` → prior day first; else today, fallback recent leftovers only if today empty.
+- Guards (up to 10 picks per run): (a) `looks_already_posted` (title vs posted_log, 7 days) or `matches_recent_post_numbers` → `posted=2`; (b) thread cap: `thread_post_count` ≥ 2 in 4 days (same named person + a 6-letter stem, or 2 shared 6-letter stems; backtest: 1st/2nd posts hit 13–15%, 3rd+ 4–5%) and score < 75 → skipped this run, left pending.
 - Regenerate card ON poster machine (collector cards don't survive across runners — collector-side render was REMOVED as dead work).
 - If `image_url`: `download_article_image` uses plain `requests` (not curl_cffi), requires HTTP(S) resolving only to public IPs, and revalidates every manual redirect. It requires `image/*`, streams with a 10MB cap, rejects over 40MP, and keeps the existing openable/≥400×250/≥8KB gates. Any rejection returns `None`, so the card and post continue without a photo; accepted photos become the **full-card darkened background** (blend 0.62, light text palette, NO photo credit line — source is in footer).
 - `post_one_to_facebook` (2-step: upload photo published=false → attach to /feed with caption).
-- On confirmed feed success, `run_poster` commits `posted=1`, `posted_at`, and `fb_post_id` **before** any Reel work.
-- Reel state is separate: `make_reel` + `post_reel_to_facebook` gets one attempt only; confirmation sets `reel_posted=1`, while failure leaves `reel_posted=0` without raising or retrying.
+- On confirmed feed success, `run_poster` commits `posted=1`, `posted_at`, and `fb_post_id` **before** any Reel work, then appends to `posted_log.txt`.
+- Reel state is separate: `make_reel` + `post_reel_to_facebook` gets one attempt only; confirmation sets `reel_posted=1` and stores `reel_video_id`, while failure leaves `reel_posted=0` without raising or retrying.
 - Ambiguous feed failures (timeout, lost connection after send, or 2xx without an id) leave `posted=0`, set `review_needed=1`, and are excluded by `pick_story_to_post`. Clean failures leave `review_needed=0` and stay queued for safe retry.
-- `build_caption`: title + `full_text` (2-3 paragraphs) + bullets + "💡 Яагаад чухал вэ? {why}" + source + link + hashtag line. Falls back to bullets-only if no full_text (old queued items). Shared by feed posts AND reels, so both get identical text/hashtags.
+- `build_caption`: title + `full_text` (2-3 paragraphs) + bullets + "💡 Яагаад чухал вэ? {why}" + optional "💬" comment prompt (fixed human-written wording; score ≥55, never on human_drama) + clean source names (`clean_source_names` strips -pol/-soc/-eco) + link + hashtag line. Falls back to bullets-only if no full_text (old queued items). Shared by feed posts AND reels, so both get identical text/hashtags.
 - **Hashtags** (`_compose_hashtag_line`): exactly **3 fixed + up to 3 article-specific = 6**, deduped. Fixed = `FIXED_HASHTAGS` (editorial constant, currently `#ИшТойм #Монгол #мэдээ`). Article tags come from the row's `hashtags`; if empty (old items or AI gave none) they fall back to `CATEGORY_HASHTAGS[category]`. Tokens are sanitized (`_sanitize_hashtag`: strip `#`, remove spaces/punctuation, word-chars only, drop leading-digit/too-short/long). `CATEGORY_HASHTAGS` fallbacks are kept distinct from the fixed tags so dedup never drops the line below 6.
 
 ## Sources (10 active; list of dicts in agent_ish.py SOURCES)
@@ -132,14 +142,17 @@ Repairs truncation: strips ```json fences; if invalid, trims to last `}`; else c
 ## Bugs already fixed (don't reintroduce)
 - **mark_seen**: must mark ALL candidates seen BEFORE prefilter, not after (else infinite re-processing).
 - **[B-02] Source-order cap regression re-fixed**: never slice candidates in source order before scoring. Keep the 40-title prefilter budget source-balanced by round-robin so every source is represented before earlier sources receive another slot.
-- **max_tokens too low** (900/1000) truncated JSON → lost stories. Now 2200 in both `summarize` and `synthesize_cluster`.
+- **max_tokens too low** (900/1000) truncated JSON → lost stories. Now 8000 in both `summarize` and `synthesize_cluster` (Opus thinking).
+- **[R-01] Stale-base regression (2026-08-26)**: commit d6a2228 replaced agent_ish.py with an older copy and silently dropped the July audit fixes (feed/reel state, SSRF guard, fetch retry, prefilter fallback cap, hashtags, dedup fixes). Restored 2026-11-18. Always start edits from the latest `main`, never from a local/older copy; check `git diff` size before committing.
+- **posted_log.txt not committed**: digest.yml must `git add -f posted_log.txt` (if present) or the repost guard starts empty every run.
+- **Collector INSERT must be OR IGNORE** (REPLACE resets posted=0 → reposts).
 - **[B-04] Stray GitHub schedule regression re-fixed**: `workflow_dispatch` is the only trigger; the rogue native cron was removed.
-- **[E-02] Workflow mode-input shell injection**: bind dispatch input through quoted `$MODE` and allowlist only `collect|post|weather|currency` before invoking Python.
+- **[E-02] Workflow mode-input shell injection**: bind dispatch input through quoted `$MODE` and allowlist only `collect|post|weather|currency|insights` before invoking Python.
 - **Collector card render** removed (poster always regenerates; was dead work).
 - **Currency**: old.mongolbank.mn dead → use monxansh mirror.
 - **Rewording dedup miss**: the dedup free-exit floor must stay ≤0.12 and the Stage-2 AI check must include bullets (both sides) with the "rewordings/updated tallies = same event" prompt — titles-only + 0.18 floor let the same event post 2-3× (e.g. 2026-07-20 Naadam casualty roundup posted 3× in one day). The ≥0.60 auto-dup gate must NOT be lowered (Trump/Macron greeting pair sits at 0.56 and is genuinely distinct).
 
-## Cost (per collect run, history): 38¢ → 31¢ (cheap dedup) → 21¢ (title prefilter). Tighter quota (6 hot+2 filler) + 2×/day keeps it low. Weather & currency = $0 (no AI). Prompt caching evaluated = not worth it (unique article text dominates, small cacheable portion).
+## Cost (per collect run, history): 38¢ → 31¢ (cheap dedup) → 21¢ (title prefilter) → Opus 5.5 since Sept 2026 (actual per-run cost printed by the `[usage]` line; the Nov 2026 audience prompt + rare card-shorten call add roughly 1–2¢). Tighter quota (6 hot+2 filler) + 2×/day keeps it low. Weather & currency = $0 (no AI). Prompt caching evaluated = not worth it (unique article text dominates, small cacheable portion).
 
 ## Known harmless git warnings (Windows)
 - `cd ish\ish` error (already in folder — skip redundant cd).

@@ -16,21 +16,23 @@ code. Its "Bugs already fixed — don't reintroduce" section is a hard regressio
 list.
 
 ## CURRENT STATE (read this first)
-The reliability audit is **complete**. Nine fixes shipped and live on `main`
-across Tiers 1–3 plus a security pair: rogue-cron removal, workflow mode-input
-allowlist, source-balanced round-robin candidate selection, run-serialization
-concurrency group, loud push-failure, split feed/reel posting state with
-ambiguous-failure quarantine, bounded prefilter cost fallback, bounded
-transient-fetch retry, and article-image SSRF/resource hardening. A data-driven
-schedule change also shipped (`FIRST_COLLECTION_HOUR=7`; new cron-job.org times).
-
-**We are now in a two-week OBSERVATION WINDOW.** The goal is to let the new
-schedule run untouched and produce a clean Facebook dataset (the prior data was
-polluted by manual `post` test runs). During this window:
-- **Do not propose or make code changes unless the user explicitly asks.**
-- If the user wants to test the pipeline, use mode `collect` (scrapes/scores,
-  never posts) — NOT `post`, which publishes to the live page.
-- The default posture is "hands off and observe," not "find things to fix."
+**2026-11-18 — audience-first optimization shipped** (branch `audience-opt`).
+- agent_ish.py was rebuilt from the last audited version (818a14a, Jul 23):
+  the Aug 26 commit d6a2228 had replaced it with an older copy and dropped
+  the July reliability fixes. Those are back, plus the Sept work (Opus 5.5,
+  posted_log, number-fingerprint dedup, comment prompt, clean source names,
+  date rule).
+- New: audience-stakes scoring with topic labels (no politics quota), short
+  cards (≤600 chars, headline ≤80), 2-day freshness gate, thread-fatigue cap,
+  per-source quotas, weekly `insights` mode, posted_log committed by the
+  workflow. Design + numbers in CONTEXT.md ("Scoring", "Poster").
+- **Measurement window: 4 weeks.** KPIs (vs Sep 25–Nov 17 baseline): viral
+  Reels/day 0.75 → ≥1.1; median views 468 → ≥650; score–views correlation
+  −0.09 → ≥+0.20; follow-ups 35% → ≤15%; 11:00 slot median 176 → ≥450.
+  Re-check at week 2 with `insights` + the Facebook export. Don't retune
+  weights before week 2 unless something is broken.
+- Deferred to after the week-2 check: holding ≥75-score stories for the
+  19:00/21:00 slots (plan item 10).
 
 ## Operating loop (when the user does ask for work)
 1. User gives a goal.
@@ -59,11 +61,13 @@ Must not break: <relevant don't-reintroduce items>
 - Touches only in-scope files.
 - Clears the "don't reintroduce" list: mark ALL candidates seen *before*
   prefilter; source-balanced round-robin (no source-order slicing);
-  `max_tokens=2200` in `summarize` and `synthesize_cluster`; no GitHub-native
-  cron in `digest.yml` (workflow_dispatch only); currency mirror handling.
+  `max_tokens=8000` in `summarize` and `synthesize_cluster` (Opus thinking);
+  no GitHub-native cron in `digest.yml` (workflow_dispatch only); currency
+  mirror handling; posted_log.txt committed; collector INSERT OR IGNORE;
+  edits start from latest `main` (see [R-01]).
 - No new cost exposure in the collect path (title-prefilter gate intact, the
   ≤8 failure fallback intact, no redundant Claude calls, prompts not oversized;
-  target ~21¢/run).
+  watch the `[usage]` line).
 - No new legal/rights exposure: zarig.mn `block` flag enforced before posting;
   wire-photo republishing stays controllable via `photo_path`.
 - Posting-state integrity: feed success writes `posted=1`+`fb_post_id` BEFORE

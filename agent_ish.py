@@ -1419,7 +1419,24 @@ def is_duplicate_of_recent(client, con, new_title, new_bullets, days=3):
         return False
 
 
-def prefilter_titles(client, candidates):
+PREFILTER_COVERED_DAYS = 3     # "already covered" list window
+PREFILTER_COVERED_MAX = 30     # titles shown to the prefilter (~1.5k tokens)
+
+
+def recent_covered_titles(con, days=PREFILTER_COVERED_DAYS,
+                          limit=PREFILTER_COVERED_MAX):
+    """Titles already queued or posted recently, newest first. Shown to the
+    prefilter so same-event re-reports are dropped BEFORE the ~4¢ summary
+    call (a Nov 18 test run spent 3 of 5 summaries on stories the final
+    dedup then threw away)."""
+    cutoff = (datetime.now(UB_TZ).date() - timedelta(days=days)).isoformat()
+    return [r[0] for r in con.execute(
+        "SELECT title FROM digests WHERE title IS NOT NULL AND "
+        "(collected_date >= ? OR posted_at >= ?) "
+        "ORDER BY run_at DESC LIMIT ?", (cutoff, cutoff, limit))]
+
+
+def prefilter_titles(client, candidates, covered=()):
     """
     Cheap batch pre-filter: rate every candidate TITLE's audience pull
     (likely reach, shares, comments, follows) in ONE Claude call (titles
@@ -1427,6 +1444,8 @@ def prefilter_titles(client, candidates):
     summarization for stories that rarely travel.
 
     candidates: list of (src, title, url) tuples.
+    covered: titles already queued/posted recently; a candidate that only
+             re-reports one of them (no new development) is scored ~0.
     Returns: list of (src, title, url, score) kept for full processing:
              the top hot titles plus a small filler quota.
     """
@@ -1466,6 +1485,16 @@ def prefilter_titles(client, candidates):
 
     titles = [t for (_s, t, _u) in candidates]
     numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(titles))
+    covered_block = ""
+    if covered:
+        covered_block = (
+            "АЛЬ ХЭДИЙН НИЙТЭЛСЭН/ДАРААЛАЛД БАЙГАА мэдээ (сүүлийн өдрүүд):\n"
+            + "\n".join(f"- {t}" for t in covered) + "\n\n"
+            "Гарчиг нь эдгээрийн аль нэгтэй ИЖИЛ үйл явдлыг (өөр эх сурвалж, "
+            "өөр найруулга, ижил тоо баримт) дахин мэдээлж байвал 0-5 оноо өг. "
+            "Харин тухайн сэдвийн ШИНЭ хөгжил (шинэ шийдвэр, шинэ хариу үйлдэл, "
+            "шинэ баримт) бол ердийнхөөрөө үнэл.\n\n"
+        )
     prompt = (
         "Чи Монголын Facebook мэдээний хуудасны редактор. Зорилго: аль мэдээ "
         "хамгийн олон хүнд хүрч, үзэлт, хуваалцалт, сэтгэгдэл, шинэ дагагч "
@@ -1483,7 +1512,8 @@ def prefilter_titles(client, candidates):
         "төлөвлөгөө, статистик тайлан, ёслол, шагнал; олны танил хүний шүүх "
         "хурал товлогдсон/хойшилсон/хорих хугацаа сунгасан гэх мэт явцын "
         "мэдээ; PR, зар; Монголтой хамаагүй гадаад мэдээ.\n\n"
-        f"Гарчигууд:\n{numbered}\n\n"
+        + covered_block +
+        f"Үнэлэх гарчгууд:\n{numbered}\n\n"
         "ЗӨВХӨН JSON массив буцаа, гарчиг тус бүрийн оноогоор дарааллаар: "
         "[оноо1, оноо2, ...] (өөр юу ч бичихгүй)."
     )
@@ -1517,7 +1547,8 @@ def prefilter_titles(client, candidates):
     # plus a small filler quota for quiet days.
     hot = sorted([x for x in scored if x[3] >= 30],
                  key=lambda x: x[3], reverse=True)[:6]
-    filler = sorted([x for x in scored if x[3] < 30],
+    # filler excludes 0-5: that band is "already covered" re-reports
+    filler = sorted([x for x in scored if 5 < x[3] < 30],
                     key=lambda x: x[3], reverse=True)[:2]
     kept = hot + filler
     dropped = len(scored) - len(kept)
@@ -1674,7 +1705,8 @@ def run_collector():
     # One batch Claude call rates all titles for audience pull; we keep
     # the top ones plus a small filler quota. This is the biggest cost
     # saver since it avoids full summarization of low-value stories.
-    candidates = prefilter_titles(client, candidates)
+    candidates = prefilter_titles(client, candidates,
+                                  covered=recent_covered_titles(con))
     if not candidates:
         print("[collector] nothing kept after prefilter")
         write_json(con)

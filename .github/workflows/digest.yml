@@ -2,9 +2,11 @@
 # (GitHub's own scheduler is unreliable for private repos, so cron-job.org
 #  hits the workflow_dispatch trigger on schedule instead.)
 #
-# Two cron-job.org jobs call this with different inputs:
-#   • collector: 3x/day weekdays (06:00, 12:00, 17:00 UB) -> mode=collect
-#   • poster:    hourly 07:00-23:00 daily               -> mode=post
+# cron-job.org jobs call this with different inputs (times UB; see CONTEXT.md):
+#   • collector: 10:15 and 16:15 daily      -> mode=collect
+#   • poster:    01,07,11,15,17,19,21 daily  -> mode=post
+#   • weather 06:45 daily, currency 06:50 weekdays
+#   • insights:  weekly (Mon 09:05)          -> mode=insights (reads Reel views)
 
 name: ish-digest
 
@@ -12,7 +14,7 @@ name: ish-digest
   workflow_dispatch:
     inputs:
       mode:
-        description: "collect or post"
+        description: "collect, post, weather, currency, or insights"
         required: false
         default: "post"
 
@@ -46,7 +48,7 @@ jobs:
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
         run: |
           case "$MODE" in
-            collect|post|weather|currency) ;;
+            collect|post|weather|currency|insights) ;;
             *) echo "Invalid mode: '$MODE'" >&2; exit 1 ;;
           esac
           python agent_ish.py "$MODE"
@@ -56,6 +58,9 @@ jobs:
           git config user.name "ish-bot"
           git config user.email "bot@ish.mn"
           git add -f digest.json towch.db
+          # posted_log.txt is the poster's durable repost guard; without
+          # committing it every run started with an empty guard.
+          if [ -f posted_log.txt ]; then git add -f posted_log.txt; fi
           git diff --cached --quiet || git commit -m "ish: $(date -u +'%Y-%m-%d %H:%M') UTC"
           # Robust push with retries. On conflict (concurrent collector/poster
           # run touched towch.db), take OUR freshly-written copy — our run just
@@ -71,7 +76,9 @@ jobs:
             git fetch origin main
             git merge -X ours origin/main -m "merge remote (keep our DB)" 2>/dev/null \
               || { git checkout --ours towch.db digest.json 2>/dev/null; \
+                   git checkout --ours posted_log.txt 2>/dev/null || true; \
                    git add -f towch.db digest.json; \
+                   if [ -f posted_log.txt ]; then git add -f posted_log.txt; fi; \
                    git commit -m "resolve: keep our DB" 2>/dev/null || true; }
             sleep 3
           done
